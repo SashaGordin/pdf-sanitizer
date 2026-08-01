@@ -305,7 +305,7 @@ report. A failed or incomplete visual review means the PDF must not be released.
 
 Release checklist:
 
-1. `automated_checks` is `PASS` and `residuals` is empty.
+1. `release_status` is `AUTOMATED_PASS` and `residuals` is empty.
 2. `tools/verify_output_text.py` reports no known identifier in the output.
 3. `tools/eval_sanitizer.py` shows recall 100% and over-redaction 0%.
 4. The `ner_review` queue has been triaged and anything genuine has been added

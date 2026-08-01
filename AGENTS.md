@@ -45,6 +45,13 @@ These are deliberately gitignored. A fresh clone will not have them:
   `git add -f` if you ever need a specific one (e.g. a small redacted fixture).
 - **`output/`, `tmp/`** — generated artifacts and intermediate working dirs.
 
+## Local dev setup
+
+- **Pre-push hook.** `tools/git-hooks/pre-push` runs the full unit suite and
+  the golden-set eval, blocking `git push` on either's failure. `core.hooksPath`
+  is a local repo setting, not itself versioned, so a fresh clone needs one
+  command to activate it: `git config core.hooksPath tools/git-hooks`.
+
 ## Agent skills
 
 ### Issue tracker

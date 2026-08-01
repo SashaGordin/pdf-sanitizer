@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Blocks `git push` on a failure of the full unit suite or the golden-set eval.
+#
+# Installed via: git config core.hooksPath tools/git-hooks
+# (run once per clone; core.hooksPath is a local repo setting, not itself
+# versioned, so a fresh clone needs this one-time step.)
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+PYTHON=".venv-anonymizer/bin/python"
+if [ ! -x "$PYTHON" ]; then
+    echo "pre-push: $PYTHON not found; see ANONYMIZATION.md to set up the venv" >&2
+    exit 1
+fi
+
+echo "pre-push: running unit test suite..." >&2
+"$PYTHON" -m unittest discover -s tests -q
+
+echo "pre-push: running golden-set eval..." >&2
+"$PYTHON" tools/eval_sanitizer.py

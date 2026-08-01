@@ -8,12 +8,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import subprocess
+
 import fitz
 from PIL import Image
 from reportlab.graphics import renderPDF
 from reportlab.graphics.barcode import qr
 from reportlab.graphics.shapes import Drawing
 from reportlab.lib.pagesizes import letter
+from reportlab.lib.pdfencrypt import StandardEncryption
 from reportlab.pdfgen import canvas
 
 
@@ -169,6 +172,17 @@ def create_rotated_text_pdf(path: Path) -> None:
     pdf.save()
 
 
+def create_encrypted_pdf(path: Path) -> None:
+    pdf = canvas.Canvas(
+        str(path), pagesize=letter,
+        encrypt=StandardEncryption("userpw", ownerPassword="ownerpw", canPrint=1, canModify=0),
+    )
+    pdf.setFont("Helvetica", 12)
+    pdf.drawString(45, 700, "Fictional Owner Holdings")
+    pdf.showPage()
+    pdf.save()
+
+
 class SanitizerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="sanitizer_test_")
@@ -197,7 +211,7 @@ class SanitizerTests(unittest.TestCase):
         source = self.root / "source.pdf"
         create_searchable_pdf(source)
         destination, report = self.run_sanitizer(source)
-        self.assertEqual(report["automated_checks"], "PASS")
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
         self.assertIn("barcode_or_qr", {c for item in report["page_redactions"] for c in item["categories"]})
         output = fitz.open(destination)
         extracted = "\n".join(page.get_text("text") for page in output)
@@ -221,7 +235,7 @@ class SanitizerTests(unittest.TestCase):
         source = self.root / "scan.pdf"
         create_scanned_pdf(source)
         destination, report = self.run_sanitizer(source)
-        self.assertEqual(report["automated_checks"], "PASS")
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
         self.assertEqual(report["rasterized_pages"], [1])
         output = fitz.open(destination)
         text = output[0].get_text("text")
@@ -247,7 +261,7 @@ class SanitizerTests(unittest.TestCase):
         text = output[0].get_text("text")
         self.assertNotIn("UNLABELLED APPROVAL MARK", text)
         self.assertIn("concrete strength 4000 psi", text)
-        self.assertEqual(report["automated_checks"], "PASS")
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
         output.close()
 
     def test_fails_closed_with_page_number_when_ocr_is_unavailable(self) -> None:
@@ -263,6 +277,60 @@ class SanitizerTests(unittest.TestCase):
         self.assertEqual(caught.exception.page_number, 1)
         self.assertNotIn("Fictional", str(caught.exception))
 
+    def test_encrypted_source_fails_closed_without_traceback_or_decryption(self) -> None:
+        source = self.root / "encrypted.pdf"
+        create_encrypted_pdf(source)
+        destination, report = self.run_sanitizer(source)
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_FAIL)
+        self.assertIn("encrypt", report["fail_reason"].lower())
+        self.assertFalse(destination.exists())
+        # No password argument or decryption call exists anywhere in the tool.
+        source_text = Path(sanitizer.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("--password", source_text)
+        self.assertNotIn(".authenticate(", source_text)
+
+    def test_tesseract_timeout_fails_closed_per_page(self) -> None:
+        source = self.root / "scan.pdf"
+        create_scanned_pdf(source)
+        real_run = subprocess.run
+
+        def timing_out(cmd, *args, **kwargs):
+            if Path(cmd[0]).name == "tesseract" or cmd[0] == self.settings.tesseract_executable:
+                raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+            return real_run(cmd, *args, **kwargs)
+
+        with mock.patch.object(subprocess, "run", side_effect=timing_out):
+            with self.assertRaises(sanitizer.PageProcessingError) as caught:
+                self.run_sanitizer(source)
+        self.assertEqual(caught.exception.page_number, 1)
+        self.assertNotIn("Fictional", str(caught.exception))
+
+    def test_ghostscript_timeout_fails_closed_without_hanging(self) -> None:
+        source = self.root / "source.pdf"
+        create_searchable_pdf(source)
+
+        def timing_out(cmd, *args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+        with mock.patch.object(subprocess, "run", side_effect=timing_out):
+            with self.assertRaises(sanitizer.PageProcessingError) as caught:
+                self.run_sanitizer(source)
+        self.assertIn("ghostscript", caught.exception.reason.lower())
+        self.assertIn("timeout", caught.exception.reason.lower())
+
+    def test_derive_release_status_state_machine(self) -> None:
+        AP, RR, RI, F, R = (
+            sanitizer.RELEASE_STATUS_AUTOMATED_PASS, sanitizer.RELEASE_STATUS_REVIEW_REQUIRED,
+            sanitizer.RELEASE_STATUS_REVIEW_INCOMPLETE, sanitizer.RELEASE_STATUS_FAIL,
+            sanitizer.RELEASE_STATUS_RELEASED,
+        )
+        self.assertEqual(sanitizer.derive_release_status(F), F)
+        self.assertEqual(sanitizer.derive_release_status(F, {"status": "complete"}), F)
+        self.assertEqual(sanitizer.derive_release_status(AP), RR)
+        self.assertEqual(sanitizer.derive_release_status(AP, {}), RR)
+        self.assertEqual(sanitizer.derive_release_status(AP, {"status": "incomplete"}), RI)
+        self.assertEqual(sanitizer.derive_release_status(AP, {"status": "complete"}), R)
+
     def test_denylist_matches_terms_wrapped_across_lines(self) -> None:
         matcher = sanitizer.DenylistMatcher({"Fictional Owner Holdings"})
         self.assertEqual(matcher.count("Prepared for Fictional Owner\nHoldings today"), 1)
@@ -273,7 +341,7 @@ class SanitizerTests(unittest.TestCase):
         source = self.root / "crossline.pdf"
         create_cross_line_pdf(source)
         destination, report = self.run_sanitizer(source)
-        self.assertEqual(report["automated_checks"], "PASS")
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
         output = fitz.open(destination)
         folded = "\n".join(page.get_text("text") for page in output).casefold()
         output.close()
@@ -314,7 +382,7 @@ class SanitizerTests(unittest.TestCase):
         result = sanitizer.verify_output(
             source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(), triage_dir,
         )
-        self.assertEqual(result["automated_checks"], "FAIL")
+        self.assertEqual(result["release_status"], sanitizer.RELEASE_STATUS_FAIL)
         residuals = result["residuals"]
         self.assertGreaterEqual(len(residuals), 2)
         self.assertEqual({residual["page"] for residual in residuals}, {1})
@@ -346,7 +414,7 @@ class SanitizerTests(unittest.TestCase):
         pdf.showPage()
         pdf.save()
         destination, report = self.run_sanitizer(source)
-        self.assertEqual(report["automated_checks"], "PASS")
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
         self.assertEqual(report.get("residuals", []), [])
         output = fitz.open(destination)
         text = output[0].get_text("text")
@@ -358,7 +426,7 @@ class SanitizerTests(unittest.TestCase):
         source = self.root / "rotated.pdf"
         create_rotated_text_pdf(source)
         destination, report = self.run_sanitizer(source)
-        self.assertEqual(report["automated_checks"], "PASS")
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
         self.assertEqual(report["size_mismatch_pages"], [])
         # Fixed at the Ghostscript layer, not by falling back to raster.
         self.assertEqual(report["rasterized_pages"], [])
@@ -410,7 +478,7 @@ class SanitizerTests(unittest.TestCase):
         pdf.save()
         with mock.patch.object(sanitizer, "flatten_with_ghostscript", injecting_flatten):
             destination, report = self.run_sanitizer(source)
-        self.assertEqual(report["automated_checks"], "PASS")
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
         self.assertGreaterEqual(report["post_flatten_redactions"].get("denylist", 0), 1)
         output = fitz.open(destination)
         text = output[0].get_text("text")
@@ -488,7 +556,7 @@ class SanitizerTests(unittest.TestCase):
             self.settings, self.root, ner_detector=detector,
         )
         # Report-only: findings never change the verdict or the checks.
-        self.assertEqual(report["automated_checks"], "PASS")
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
         self.assertTrue(all(report["checks"].values()))
         review = report["ner_review"]
         self.assertEqual(review["mode"], "report_only")
@@ -941,7 +1009,7 @@ class SuppressionSymmetryTest(unittest.TestCase):
 
     def test_schedule_cells_survive_and_the_run_still_passes(self) -> None:
         report = self.run_with(self.lex)
-        self.assertEqual(report["automated_checks"], "PASS")
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
         # Suppression is counted and attributed, never silent.
         self.assertTrue(report["suppressed_by_rule"])
         self.assertIn("structural", report["suppressed_by_rule"])

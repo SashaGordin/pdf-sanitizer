@@ -132,6 +132,57 @@ class PageProcessingError(RuntimeError):
         super().__init__(f"page {page_number}: {reason}")
 
 
+# Release-status vocabulary. Replaces the old single PASS/FAIL string and the
+# HUMAN_VISUAL_REVIEW_REQUIRED constant everywhere in the report.
+#
+# A per-document report's release_status is the automated-gate result alone
+# (AUTOMATED_PASS/FAIL): a document has no reviewer of its own, so it cannot
+# know whether human review has happened. AUTOMATED_PASS is documented here as
+# non-terminal — nothing downstream may treat it as safe to ship.
+#
+# An overall-run status additionally folds in review state via
+# derive_release_status() below, and is the only place REVIEW_REQUIRED,
+# REVIEW_INCOMPLETE, and RELEASED can appear.
+RELEASE_STATUS_AUTOMATED_PASS = "AUTOMATED_PASS"
+RELEASE_STATUS_REVIEW_REQUIRED = "REVIEW_REQUIRED"
+RELEASE_STATUS_REVIEW_INCOMPLETE = "REVIEW_INCOMPLETE"
+RELEASE_STATUS_FAIL = "FAIL"
+RELEASE_STATUS_RELEASED = "RELEASED"
+RELEASE_STATUSES = frozenset({
+    RELEASE_STATUS_AUTOMATED_PASS, RELEASE_STATUS_REVIEW_REQUIRED,
+    RELEASE_STATUS_REVIEW_INCOMPLETE, RELEASE_STATUS_FAIL, RELEASE_STATUS_RELEASED,
+})
+
+TESSERACT_TIMEOUT_SECONDS = 120
+GHOSTSCRIPT_TIMEOUT_SECONDS = 30 * 60
+
+
+def automated_gate_status(checks: dict[str, bool]) -> str:
+    """The automated-only verdict for one document: AUTOMATED_PASS or FAIL.
+
+    Never terminal on its own — see the release-status vocabulary note above.
+    """
+    return RELEASE_STATUS_AUTOMATED_PASS if all(checks.values()) else RELEASE_STATUS_FAIL
+
+
+def derive_release_status(automated_status: str, review: dict | None = None) -> str:
+    """The outward release status for a run, folding automated results
+    together with review state.
+
+    `review` is None (review has not started) until a human records one via
+    the manifest's review fields (populated outside this tool — no reviewer
+    UI is in scope). Its `status` key, once present, is "complete" or
+    "incomplete".
+    """
+    if automated_status != RELEASE_STATUS_AUTOMATED_PASS:
+        return RELEASE_STATUS_FAIL
+    if not review or not review.get("status"):
+        return RELEASE_STATUS_REVIEW_REQUIRED
+    if review["status"] != "complete":
+        return RELEASE_STATUS_REVIEW_INCOMPLETE
+    return RELEASE_STATUS_RELEASED
+
+
 @dataclass(frozen=True)
 class Line:
     block: int
@@ -1335,10 +1386,14 @@ def run_tesseract_tsv(image: Image.Image, settings: Settings, temp_dir: Path) ->
         raise RuntimeError("local OCR executable is unavailable")
     image_path = temp_dir / "page_image.png"
     image.save(image_path, format="PNG", dpi=(settings.ocr_dpi, settings.ocr_dpi))
-    completed = subprocess.run(
-        [executable, str(image_path), "stdout", "-l", "eng", "--psm", "11", "tsv"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [executable, str(image_path), "stdout", "-l", "eng", "--psm", "11", "tsv"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+            timeout=TESSERACT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"local OCR exceeded {TESSERACT_TIMEOUT_SECONDS}s timeout") from exc
     if completed.returncode != 0:
         raise RuntimeError("local OCR failed")
     words: list[OcrWord] = []
@@ -1579,15 +1634,24 @@ def flatten_with_ghostscript(source: Path, destination: Path, settings: Settings
     if executable is None:
         return None
     intermediate = destination.with_name("ghostscript_intermediate.pdf")
-    completed = subprocess.run(
-        [
-            executable, "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER",
-            "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.7",
-            "-dAutoRotatePages=/None",
-            "-dPreserveAnnots=false", f"-sOutputFile={intermediate}", str(source),
-        ],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [
+                executable, "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER",
+                "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.7",
+                "-dAutoRotatePages=/None",
+                "-dPreserveAnnots=false", f"-sOutputFile={intermediate}", str(source),
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            timeout=GHOSTSCRIPT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # A hang here must fail the whole document in a controlled way, not
+        # silently fall back to the (equally slow, on a pathological input)
+        # per-page raster path the "unavailable executable" case below uses.
+        raise PageProcessingError(
+            0, f"ghostscript flatten exceeded {GHOSTSCRIPT_TIMEOUT_SECONDS}s timeout",
+        ) from exc
     if completed.returncode != 0 or not intermediate.is_file():
         return None
     try:
@@ -2002,7 +2066,7 @@ def verify_output(
         "blank_render_pages": blank_render_pages,
         "interactive_pages": interactive_pages,
         "rasterized_pages": sorted(raster_pages),
-        "automated_checks": "PASS" if all(checks.values()) else "FAIL",
+        "release_status": automated_gate_status(checks),
     }
     if ner_detector is not None:
         distinct_by_label: collections.Counter[str] = collections.Counter()
@@ -2045,6 +2109,22 @@ def sanitize_document(
         source_doc = fitz.open(source)
     except Exception as exc:
         raise SystemExit(f"{document_id}: source PDF could not be opened") from exc
+    if source_doc.is_encrypted:
+        # Checked immediately after opening, before any page-dependent
+        # operation. This tool never attempts decryption and never accepts a
+        # password argument — detection only, always a controlled FAIL.
+        page_count = len(source_doc)
+        source_doc.close()
+        return {
+            "document_id": document_id,
+            "source_sha256": sha256_file(source),
+            "pages": page_count,
+            "release_status": RELEASE_STATUS_FAIL,
+            "fail_reason": (
+                "source PDF is encrypted; this tool never attempts decryption "
+                "or accepts a password, so an encrypted input cannot be processed"
+            ),
+        }
     source_sizes = [(round(page.rect.width, 3), round(page.rect.height, 3)) for page in source_doc]
     if settings.redact_repeated_margin_images:
         margin_images, image_complexity_pages = repeated_margin_images(source_doc, settings.repeated_image_min_pages)
@@ -2214,7 +2294,6 @@ def sanitize_document(
             for page, categories in sorted(page_categories.items()) if categories
         ],
         **verification,
-        "release_status": "HUMAN_VISUAL_REVIEW_REQUIRED",
     }
 
 
@@ -2307,11 +2386,16 @@ def main() -> int:
     except PageProcessingError as exc:
         print(f"Processing stopped at page {exc.page_number}: {exc.reason}; no page content displayed", file=sys.stderr)
         return 3
+    all_automated_checks_pass = all(
+        report["release_status"] == RELEASE_STATUS_AUTOMATED_PASS for report in reports
+    )
     payload = {
         "schema_version": 2,
         "documents": reports,
-        "all_automated_checks_pass": all(report["automated_checks"] == "PASS" for report in reports),
-        "release_status": "HUMAN_VISUAL_REVIEW_REQUIRED",
+        "all_automated_checks_pass": all_automated_checks_pass,
+        "release_status": derive_release_status(
+            RELEASE_STATUS_AUTOMATED_PASS if all_automated_checks_pass else RELEASE_STATUS_FAIL,
+        ),
         "notes": [
             "The report contains counts, categories, page numbers, masked shapes, and hashes only.",
             "Residual triage crops under the output triage/ directory contain original page regions; treat them as NDA material and delete after review.",
