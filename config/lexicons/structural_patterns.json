@@ -1,0 +1,126 @@
+{
+  "_about": {
+    "purpose": "Structured-numeric and layout constructs that every CSI-formatted construction document contains. A detector span that is entirely one of these is a document-structure artifact, never an identifier — no real street address is shaped like a MasterFormat code, and no person is named '3 CIR'.",
+    "matching": "A candidate is suppressed only when the pattern consumes the ENTIRE trimmed span (fullmatch), never a substring.",
+    "authority": "Suppression applies to detector candidates (regex heuristics and NER) only. It NEVER overrides a denylist match — the denylist is the authoritative sensitive-term list, and a project number legitimately looks like 'CCR-21109'.",
+    "scope": "Project-independent. Safe to share across every project."
+  },
+  "suppress_if_span_matches": [
+    {
+      "name": "csi_masterformat_code",
+      "pattern": "\\d{2}[ \u00a0]\\d{2}[ \u00a0]\\d{2}(?:\\.\\d{1,2})?",
+      "why": "CSI MasterFormat division-section numbering, e.g. 32 13 13, 28 46 21.11. Read as a street address by the address regex and by GLiNER."
+    },
+    {
+      "name": "csi_section_page_footer",
+      "pattern": "\\d{6}\\s*[-\u2013\u2014]\\s*\\d{1,3}",
+      "why": "Compact section number plus page, e.g. '099000 - 23', in the running footer of every spec section."
+    },
+    {
+      "name": "csi_division_heading",
+      "pattern": "(?:DIVISION|Division)\\s+\\d{1,2}(?:\\s*[-\u2013\u2014]\\s*.{0,60})?",
+      "why": "Division heading line."
+    },
+    {
+      "name": "standards_designation",
+      "pattern": "(?:ASTM|ANSI|UL|NFPA|IEEE|AISC|ACI|AWS|NEMA|ASHRAE|SMACNA|ASME|API|CSA|FM|ICC|IBC|IECC|IPC|IMC|NEC|ADA|OSHA|SDI|AAMA|AWI|TCNA|SSPC|NECA|BICSI|TIA|EIA|ISO|ASCE|AISI|CISCA|GANA|NRCA|SPRI|AMCA|AABC|NEBB|ETL|CSI|ARI|AHRI|SMA|WDMA|NAAMM)(?:[/-][A-Z]{2,8})?\\s*[A-Z]?\\d[A-Z0-9./ -]{0,14}",
+      "why": "Standards designations, e.g. ASTM A36, UL 1479, NFPA 13, ANSI/TIA 568. GLiNER labels the issuing body an organization."
+    },
+    {
+      "name": "standards_body_acronym",
+      "pattern": "(?:ASTM|ANSI|UL|NFPA|IEEE|AISC|ACI|AWS|NEMA|ASHRAE|SMACNA|ASME|API|CSA|ICC|IBC|IECC|IPC|IMC|NEC|ADA|OSHA|SDI|AAMA|AWI|TCNA|SSPC|NECA|BICSI|TIA|EIA|ISO|ASCE|AISI|CISCA|GANA|NRCA|SPRI|AMCA|AABC|NEBB|AHRI|WDMA|NAAMM|AIA|EJCDC|NCARB|LEED)",
+      "why": "Bare standards-body or credential acronym with no designation following."
+    },
+    {
+      "name": "dimension_callout",
+      "pattern": "\\d{1,4}(?:[ -]\\d{1,2}/\\d{1,2})?(?:\\.\\d+)?\\s*(?:\"|''|\u201d|in\\.?|inch(?:es)?|'|ft\\.?|feet|foot|mm|cm|m|yd|o\\.c\\.|OC|ga\\.?|gauge|AWG|psi|psf|pcf|cfm|gpm|fpm|kW|kVA|hp|deg|\u00b0)(?:\\s+(?:o\\.c\\.|OC|each way|min\\.?|max\\.?|nom\\.?|typ\\.?))?",
+      "why": "Dimension and quantity callouts, e.g. '16 inches o.c. each way', '20 ft', '18GA'. Matched by the leading-number branch of the street-address regex."
+    },
+    {
+      "name": "sheet_number",
+      "pattern": "[A-Z]{1,3}-?\\d{1,2}\\.\\d{1,2}[A-Z]?",
+      "why": "Drawing sheet numbers, e.g. L2.0, E-1.1, M2.3."
+    },
+    {
+      "name": "panel_circuit_reference",
+      "pattern": "\\d{1,3}\\s*(?:CIR|CKT|POLE|P|A|AMP|AMPS|V|VA)",
+      "why": "Panel-schedule circuit and rating cells, e.g. '3 CIR', '40 CIR', '20 A'. The street-address regex reads CIR as Circle."
+    },
+    {
+      "name": "date_numeric",
+      "pattern": "\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}(?:\\s+\\d{1,2}:\\d{2}(?::\\d{2})?\\s*(?:[AP]\\.?M\\.?)?(?:\\s+[A-Z]{2,4})?)?",
+      "why": "Issue dates and plot timestamps in title blocks and footers."
+    },
+    {
+      "name": "cross_reference_index",
+      "pattern": "\\d{1,2}(?:\\.\\d{1,2}){1,4}(?:\\s*,\\s*\\d{1,2}(?:\\.\\d{1,2}){0,4}){2,}",
+      "why": "AIA A201 cross-reference index runs, e.g. '3.10.1, 3.10.2, 3.11, 3.12, 4.2'."
+    },
+    {
+      "name": "article_clause_reference",
+      "pattern": "(?:Article|Section|Paragraph|Subparagraph|Clause|Part)\\s+\\d{1,2}(?:\\.\\d{1,3})*",
+      "why": "Internal cross references."
+    },
+    {
+      "name": "drawing_scale",
+      "pattern": "\\d{1,2}(?:/\\d{1,2})?\\s*\"?\\s*=\\s*\\d{1,3}'(?:\\s*-\\s*\\d{1,2}\\s*\")?|(?:N\\.?T\\.?S\\.?|NOT TO SCALE)",
+      "why": "Scale notations in drawing title blocks."
+    },
+    {
+      "name": "signature_rule",
+      "pattern": "[_\u2014\u2013-]{4,}|\\(?\\s*(?:signature|printed name|date|title|by)\\s*\\)?[_\\s]*",
+      "why": "Blank signature rules and their captions on execution pages."
+    },
+    {
+      "name": "form_placeholder",
+      "pattern": "[<(\\[][^<>()\\[\\]]{0,80}[>)\\]]\\.?",
+      "why": "AIA/EJCDC fill-in-the-blank placeholders, e.g. '<Insert name of Owner>.', '(Name, legal status and address)'."
+    },
+    {
+      "name": "letter_spaced_label",
+      "pattern": "(?:[A-Z]\\s){3,}[A-Z]\\s*(?:[A-Z](?:\\s[A-Z])*\\s*)*",
+      "why": "Title-block labels typeset with letter spacing, e.g. 'S H E E T  T I T L E', 'J O B  N U M B E R'."
+    },
+    {
+      "name": "north_arrow_label",
+      "pattern": "(?:PROJECT|TRUE|PLAN)\\s+NORTH",
+      "why": "North-arrow annotation read as a project number by the project/job regex."
+    }
+  ],
+  "manufacturer_context_triggers": {
+    "_why": "Phrases whose presence within a short window of a candidate span marks it as a product or manufacturer reference. Near-zero false-positive rate in CSI Part 2 - Products. Used as EVIDENCE that down-weights a candidate, never as unconditional suppression — a real subcontractor can be named next to one of these.",
+    "window_chars": 120,
+    "phrases": [
+      "or approved equal",
+      "or equal",
+      "Basis of Design",
+      "Basis-of-Design",
+      "Acceptable Manufacturers",
+      "Available Manufacturers",
+      "Approved Manufacturers",
+      "Manufacturers:",
+      "Subject to compliance with requirements",
+      "Model No",
+      "Model Number",
+      "Catalog No",
+      "Catalog Number",
+      "Part No",
+      "Product:",
+      "Products:",
+      "Series",
+      "Type No",
+      "Mark",
+      "Fixture Type",
+      "Equipment Tag",
+      "Schedule"
+    ]
+  },
+  "csi_zone_markers": {
+    "_why": "Anchors for the Division/Section/Part state machine. An organization named inside PART 2 - PRODUCTS of a technical division is overwhelmingly a manufacturer; one named inside Division 00 (Procurement and Contracting Requirements) is overwhelmingly a project party.",
+    "section_header": "^\\s*SECTION\\s+(\\d{2}\\s?\\d{2}\\s?\\d{2}(?:\\.\\d{1,2})?)\\s*[-\u2013\u2014]?\\s*(.{0,80})$",
+    "part_header": "^\\s*PART\\s+(\\d)\\s*[-\u2013\u2014]?\\s*(GENERAL|PRODUCTS|EXECUTION)\\b",
+    "section_end": "^\\s*END OF SECTION",
+    "party_divisions": ["00"],
+    "product_part": "2"
+  }
+}

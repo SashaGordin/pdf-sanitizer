@@ -1,0 +1,42 @@
+{
+  "ocr_dpi": 300,
+  "barcode_dpi": 72,
+  "barcode_max_dimension": 2400,
+  "min_text_chars": 20,
+  "progress_every_pages": 100,
+  "tesseract_executable": "tesseract",
+  "ghostscript_executable": "gs",
+  "detect_barcodes": true,
+  "redact_repeated_margin_images": true,
+  "repeated_image_min_pages": 3,
+  "ner": {
+    "enabled": false,
+    "model_dir": "models/gliner_multi_pii-v1",
+    "labels": [
+      "person name",
+      "company name",
+      "organization",
+      "project name",
+      "street address",
+      "city"
+    ],
+    "threshold": 0.5,
+    "max_findings": 500
+  },
+  "regions": [
+    {
+      "name": "example-cover-approval-area",
+      "category": "approval_area",
+      "pages": [1],
+      "rect": [0.7, 0.0, 1.0, 0.25],
+      "enabled": false
+    },
+    {
+      "name": "example-title-block",
+      "category": "title_block",
+      "pages": "all",
+      "rect": [0.75, 0.75, 1.0, 1.0],
+      "enabled": false
+    }
+  ]
+}

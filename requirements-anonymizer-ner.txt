@@ -1,0 +1,4 @@
+# Optional report-only NER review layer. Installs torch (~1 GB); keep it out
+# of the core requirements. Model weights are downloaded once, separately —
+# see ANONYMIZATION.md. The sanitizer itself never accesses the network.
+gliner>=0.2,<1

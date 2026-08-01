@@ -1,0 +1,49 @@
+{
+  "_about": {
+    "purpose": "Primary seeding path for the per-project denylist. Everything here is known before the PDF is opened — it is in the contract, the title block, and the PM system — so filling this in is both faster and more accurate than scraping candidates back out of the document.",
+    "usage": "Copy to project-metadata.local.json, fill in, then run with --project-metadata config/project-metadata.local.json. Values are merged with --denylist when both are supplied.",
+    "handling": "Contains project-identifying information. Save with mode 0600 and treat as NDA-protected source material. *.local.json is git-ignored.",
+    "guidance": "List every spelling variant that appears in the documents: full legal name, common short form, all-caps title-block form, and any abbreviation. The matcher is exact (whitespace-tolerant, case-insensitive) — it will not guess."
+  },
+
+  "project_name": [
+    "Martin Luther King Jr. Recreation Center",
+    "MLK Recreation Center",
+    "MLK Rec Center"
+  ],
+  "project_number": [
+    "CCR-21109",
+    "CCR Project 21109"
+  ],
+  "project_address": [
+    "705 East 14th Court, Panama City, FL 32401"
+  ],
+  "site_address": [
+    "East 14th Street"
+  ],
+  "owner": [
+    "City of Panama City",
+    "City of Panama City, Florida"
+  ],
+  "architect": [
+    "CCR Architecture & Interiors",
+    "Cohen Carnaggio Reynolds, Inc.",
+    "COHEN CARNAGGIO REYNOLDS"
+  ],
+  "engineers": [
+    "Magnum Engineering",
+    "Panhandle Engineering, Inc.",
+    "Colonial Engineering, Inc."
+  ],
+  "contractors": [],
+  "consultants": [],
+  "personnel": [
+    "Dawn Kirkland",
+    "Jacklyn Hamric",
+    "James T. Vickers"
+  ],
+  "other_identifiers": [
+    "purchasing@panamacity.gov",
+    "Panama City, Florida"
+  ]
+}

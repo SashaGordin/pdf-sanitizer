@@ -1,0 +1,27 @@
+# --- Python ---
+.venv-anonymizer/
+.venv/
+__pycache__/
+*.py[cod]
+
+# --- Local config (may hold credentials) ---
+config/*.local.json
+config/*.local.json.bak
+
+# --- Downloaded model weights (1.1 GB; re-fetch, don't commit) ---
+# See AGENTS.md for the download command. Path is referenced by
+# config/sanitizer.json and tools/anonymize_construction_pdfs.py.
+models/
+
+# --- Client source documents (contain the PII this tool strips) ---
+*.pdf
+!tests/fixtures/**/*.pdf
+
+# --- Generated output ---
+output/
+
+# --- Scratch / intermediate working dirs ---
+tmp/
+
+# --- macOS ---
+.DS_Store
