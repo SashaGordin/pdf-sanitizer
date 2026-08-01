@@ -9,17 +9,17 @@ inputs visibly changes the corresponding hash.
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Report/manifest include a fingerprint block with per-input hashes
+- [x] Report/manifest include a fingerprint block with per-input hashes
       (denylist, project-metadata, config, allowlist, each lexicon file) plus
       a code identity (git commit SHA, or a computed build digest when no
       commit is available).
-- [ ] Running the sanitizer twice against unchanged inputs/code/policy yields
+- [x] Running the sanitizer twice against unchanged inputs/code/policy yields
       an identical fingerprint block.
-- [ ] Changing the denylist, a lexicon file, or the config changes only the
+- [x] Changing the denylist, a lexicon file, or the config changes only the
       corresponding hash(es) in the fingerprint, leaving the rest unchanged.
-- [ ] Fingerprint computation never reads or logs raw sensitive values
+- [x] Fingerprint computation never reads or logs raw sensitive values
       (hashes and version identifiers only).
-- [ ] Tests assert the fingerprint's hashes match the actual on-disk
+- [x] Tests assert the fingerprint's hashes match the actual on-disk
       denylist/config/lexicon file contents at the time of the run.

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import os
+import re
 import sys
 import tempfile
 import unittest
@@ -1035,6 +1038,259 @@ class SuppressionSymmetryTest(unittest.TestCase):
         # The pre-lexicon behaviour: table content eaten by the address regex.
         self.assertNotIn("BASKETBALL COURT", text)
         self.assertNotIn("Sycamore", text)
+
+
+class FingerprintTest(unittest.TestCase):
+    """build_fingerprint() hashes match on-disk content, are stable across
+    repeated calls, and changing one input never touches another's hash."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="fingerprint_test_")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+        self.denylist_path = self.root / "denylist.json"
+        self.denylist_path.write_text(json.dumps({"identifiers": ["Fake Denylist Term"]}))
+        self.config_path = self.root / "config.json"
+        self.config_path.write_text(json.dumps({"ocr_dpi": 300}))
+        self.allowlist_path = self.root / "allowlist.json"
+        self.allowlist_path.write_text(json.dumps({"entries": []}))
+        self.project_metadata_path = self.root / "project-metadata.json"
+        self.project_metadata_path.write_text(json.dumps({"project_name": ["Fake Project"]}))
+        self.lexicon_dir = self.root / "lexicons"
+        self.lexicon_dir.mkdir()
+        for name in sanitizer.LEXICON_FILENAMES:
+            (self.lexicon_dir / name).write_text("{}")
+        self.script_path = self.root / "script.py"
+        self.script_path.write_text("# fake sanitizer script v1\n")
+
+    def build(self, **overrides) -> dict:
+        kwargs = dict(
+            script_path=self.script_path,
+            repo_root=self.root,
+            denylist_path=self.denylist_path,
+            project_metadata_path=self.project_metadata_path,
+            config_path=self.config_path,
+            allowlist_path=self.allowlist_path,
+            lexicon_dir=self.lexicon_dir,
+        )
+        kwargs.update(overrides)
+        return sanitizer.build_fingerprint(**kwargs)
+
+    def test_hashes_match_actual_on_disk_content(self) -> None:
+        fp = self.build()
+        self.assertEqual(fp["denylist_sha256"], hashlib.sha256(self.denylist_path.read_bytes()).hexdigest())
+        self.assertEqual(
+            fp["project_metadata_sha256"],
+            hashlib.sha256(self.project_metadata_path.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(fp["config_sha256"], hashlib.sha256(self.config_path.read_bytes()).hexdigest())
+        self.assertEqual(fp["allowlist_sha256"], hashlib.sha256(self.allowlist_path.read_bytes()).hexdigest())
+        for name in sanitizer.LEXICON_FILENAMES:
+            self.assertEqual(
+                fp["lexicon_sha256"][name],
+                hashlib.sha256((self.lexicon_dir / name).read_bytes()).hexdigest(),
+            )
+        self.assertEqual(
+            fp["code"]["build_digest_sha256"],
+            hashlib.sha256(self.script_path.read_bytes()).hexdigest(),
+        )
+
+    def test_repeated_calls_are_identical(self) -> None:
+        self.assertEqual(self.build(), self.build())
+
+    def test_changing_config_changes_only_config_hash(self) -> None:
+        before = self.build()
+        self.config_path.write_text(json.dumps({"ocr_dpi": 999}))
+        after = self.build()
+        self.assertNotEqual(before["config_sha256"], after["config_sha256"])
+        for key in ("denylist_sha256", "project_metadata_sha256", "allowlist_sha256", "lexicon_sha256", "code"):
+            self.assertEqual(before[key], after[key], key)
+
+    def test_changing_one_lexicon_file_changes_only_that_entry(self) -> None:
+        before = self.build()
+        target = sanitizer.LEXICON_FILENAMES[0]
+        (self.lexicon_dir / target).write_text(json.dumps({"terms": ["changed"]}))
+        after = self.build()
+        self.assertNotEqual(before["lexicon_sha256"][target], after["lexicon_sha256"][target])
+        for name in sanitizer.LEXICON_FILENAMES:
+            if name != target:
+                self.assertEqual(before["lexicon_sha256"][name], after["lexicon_sha256"][name])
+        for key in ("denylist_sha256", "project_metadata_sha256", "config_sha256", "allowlist_sha256", "code"):
+            self.assertEqual(before[key], after[key], key)
+
+    def test_missing_optional_inputs_hash_to_none(self) -> None:
+        fp = self.build(
+            project_metadata_path=None,
+            allowlist_path=self.root / "missing_allowlist.json",
+            denylist_path=self.root / "missing_denylist.json",
+        )
+        self.assertIsNone(fp["project_metadata_sha256"])
+        self.assertIsNone(fp["allowlist_sha256"])
+        self.assertIsNone(fp["denylist_sha256"])
+
+    def test_missing_lexicon_directory_yields_empty_dict(self) -> None:
+        fp = self.build(lexicon_dir=self.root / "does-not-exist")
+        self.assertEqual(fp["lexicon_sha256"], {})
+
+    def test_stray_lexicon_file_is_ignored(self) -> None:
+        # A file in the lexicon directory that isn't one of the fixed
+        # LEXICON_FILENAMES has zero effect on sanitizer behaviour (per
+        # load_lexicons) and must not spuriously change the fingerprint.
+        before = self.build()
+        (self.lexicon_dir / "unrelated_notes.json").write_text(json.dumps({"scratch": True}))
+        after = self.build()
+        self.assertEqual(before, after)
+        self.assertNotIn("unrelated_notes.json", after["lexicon_sha256"])
+
+
+class CodeIdentityTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="code_identity_test_")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_build_digest_matches_script_bytes_and_changes_on_edit(self) -> None:
+        script = self.root / "script.py"
+        script.write_text("v1\n")
+        first = sanitizer.code_identity(script, self.root)
+        self.assertEqual(first["build_digest_sha256"], hashlib.sha256(b"v1\n").hexdigest())
+        script.write_text("v2\n")
+        second = sanitizer.code_identity(script, self.root)
+        self.assertEqual(second["build_digest_sha256"], hashlib.sha256(b"v2\n").hexdigest())
+        self.assertNotEqual(first["build_digest_sha256"], second["build_digest_sha256"])
+
+    def test_no_git_repo_yields_no_commit(self) -> None:
+        script = self.root / "script.py"
+        script.write_text("no git here\n")
+        # Merge into the existing environment rather than replacing it —
+        # replacing wholesale drops PATH and makes git itself unresolvable,
+        # which would pass this test for the wrong reason.
+        with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(self.root)}):
+            identity = sanitizer.code_identity(script, self.root)
+        self.assertIsNone(identity["commit"])
+        self.assertIsNone(identity["commit_dirty"])
+
+    def test_real_repo_reports_commit_and_dirty_flag(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        identity = sanitizer.code_identity(MODULE_PATH, repo_root)
+        self.assertRegex(identity["commit"], r"^[0-9a-f]{40}$")
+        self.assertIn(identity["commit_dirty"], (True, False))
+
+    def test_nested_directory_without_its_own_git_does_not_inherit_ancestor_head(self) -> None:
+        outer = self.root / "outer"
+        outer.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=outer, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.invalid"], cwd=outer, check=True, capture_output=True,
+        )
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=outer, check=True, capture_output=True)
+        (outer / "file.txt").write_text("content\n")
+        subprocess.run(["git", "add", "file.txt"], cwd=outer, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=outer, check=True, capture_output=True)
+        inner = outer / "inner"
+        inner.mkdir()
+        script = inner / "script.py"
+        script.write_text("nested\n")
+        identity = sanitizer.code_identity(script, inner)
+        self.assertIsNone(identity["commit"])
+        self.assertIsNone(identity["commit_dirty"])
+
+
+class BuildRunPayloadTest(unittest.TestCase):
+    FAKE_FINGERPRINT = {
+        "code": {"commit": "abc123", "commit_dirty": False, "build_digest_sha256": "deadbeef"},
+        "denylist_sha256": "aaa",
+        "project_metadata_sha256": None,
+        "config_sha256": "bbb",
+        "allowlist_sha256": "ccc",
+        "lexicon_sha256": {"boilerplate.json": "ddd"},
+    }
+
+    def test_all_pass_carries_fingerprint_and_bumps_schema(self) -> None:
+        reports = [{"release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS}]
+        payload = sanitizer.build_run_payload(reports, self.FAKE_FINGERPRINT, ner_enabled=False)
+        self.assertEqual(payload["fingerprint"], self.FAKE_FINGERPRINT)
+        self.assertEqual(payload["schema_version"], 3)
+        self.assertTrue(payload["all_automated_checks_pass"])
+        self.assertEqual(payload["release_status"], sanitizer.RELEASE_STATUS_REVIEW_REQUIRED)
+        self.assertFalse(any("NER" in note for note in payload["notes"]))
+
+    def test_a_failing_document_fails_the_run(self) -> None:
+        reports = [
+            {"release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS},
+            {"release_status": sanitizer.RELEASE_STATUS_FAIL},
+        ]
+        payload = sanitizer.build_run_payload(reports, self.FAKE_FINGERPRINT, ner_enabled=False)
+        self.assertFalse(payload["all_automated_checks_pass"])
+        self.assertEqual(payload["release_status"], sanitizer.RELEASE_STATUS_FAIL)
+
+    def test_ner_enabled_appends_a_note(self) -> None:
+        reports = [{"release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS}]
+        payload = sanitizer.build_run_payload(reports, self.FAKE_FINGERPRINT, ner_enabled=True)
+        self.assertTrue(any("NER" in note for note in payload["notes"]))
+
+
+class FingerprintCliWiringTest(unittest.TestCase):
+    """main() actually computes and writes the fingerprint (catches a wrong
+    args.* passed through, or a Path(__file__) misuse the pure-function tests
+    above can't see)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="fingerprint_cli_test_")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+        self.source = self.root / "source.pdf"
+        pdf = canvas.Canvas(str(self.source), pagesize=letter)
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(45, 700, "OWNER: Fictional Owner Holdings")
+        pdf.drawString(45, 670, "Ordinary technical text remains searchable")
+        pdf.save()
+
+        self.denylist_path = self.root / "denylist.json"
+        self.denylist_path.write_text(json.dumps({"identifiers": ["Fictional Owner Holdings"]}))
+        self.config_path = self.root / "config.json"
+        self.config_path.write_text(json.dumps({
+            "detect_barcodes": False,
+            "redact_repeated_margin_images": False,
+            "min_text_chars": 5,
+            "progress_every_pages": 0,
+        }))
+        self.allowlist_path = self.root / "allowlist.json"
+        self.allowlist_path.write_text(json.dumps({"entries": []}))
+        self.lexicon_dir = self.root / "lexicons"
+        self.lexicon_dir.mkdir()
+        for name in sanitizer.LEXICON_FILENAMES:
+            (self.lexicon_dir / name).write_text("{}")
+
+    def run_main(self, report_path: Path) -> dict:
+        argv = [
+            str(self.source),
+            "--output-dir", str(self.root / "output"),
+            "--report", str(report_path),
+            "--config", str(self.config_path),
+            "--denylist", str(self.denylist_path),
+            "--lexicons", str(self.lexicon_dir),
+            "--allowlist", str(self.allowlist_path),
+        ]
+        exit_code = sanitizer.main(argv)
+        self.assertEqual(exit_code, 0)
+        return json.loads(report_path.read_text())
+
+    def test_two_runs_yield_identical_fingerprint(self) -> None:
+        first = self.run_main(self.root / "report1.json")
+        second = self.run_main(self.root / "report2.json")
+        self.assertEqual(first["fingerprint"], second["fingerprint"])
+        self.assertEqual(
+            first["fingerprint"]["denylist_sha256"],
+            hashlib.sha256(self.denylist_path.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            first["fingerprint"]["config_sha256"],
+            hashlib.sha256(self.config_path.read_bytes()).hexdigest(),
+        )
+        self.assertIsNone(first["fingerprint"]["project_metadata_sha256"])
 
 
 if __name__ == "__main__":

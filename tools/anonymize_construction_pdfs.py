@@ -372,6 +372,15 @@ def candidate_suppression(
 DEFAULT_LEXICON_DIR = "config/lexicons"
 DEFAULT_ALLOWLIST = "config/allowlist.shared.json"
 
+LEXICON_CONTRACT_DEFINED_TERMS_FILENAME = "contract_defined_terms.json"
+LEXICON_STRUCTURAL_PATTERNS_FILENAME = "structural_patterns.json"
+LEXICON_BOILERPLATE_FILENAME = "boilerplate.json"
+LEXICON_FILENAMES = (
+    LEXICON_CONTRACT_DEFINED_TERMS_FILENAME,
+    LEXICON_STRUCTURAL_PATTERNS_FILENAME,
+    LEXICON_BOILERPLATE_FILENAME,
+)
+
 
 @dataclass(frozen=True)
 class Lexicons:
@@ -614,9 +623,9 @@ def load_lexicons(
             raise SystemExit(f"Lexicon file '{name}' must contain an object")
         return payload
 
-    defined = read("contract_defined_terms.json")
-    structural_payload = read("structural_patterns.json")
-    boiler = read("boilerplate.json")
+    defined = read(LEXICON_CONTRACT_DEFINED_TERMS_FILENAME)
+    structural_payload = read(LEXICON_STRUCTURAL_PATTERNS_FILENAME)
+    boiler = read(LEXICON_BOILERPLATE_FILENAME)
 
     defined_strip_chars = defined.get("strip_chars", "")
     defined_affixes = tuple(defined.get("strip_affixes", ()))
@@ -792,6 +801,68 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def code_identity(script_path: Path, repo_root: Path, *, timeout: float = 5.0) -> dict:
+    """Identify the exact code that ran. build_digest_sha256 is the ground
+    truth (always present, catches uncommitted edits); commit/commit_dirty are
+    best-effort human-readable provenance, populated only when git is
+    available. Never reads or returns file content, only hashes and git
+    identifiers."""
+    script_path = script_path.resolve()
+    build_digest = sha256_file(script_path)
+    commit: str | None = None
+    dirty: bool | None = None
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_root,
+            capture_output=True, text=True, timeout=timeout,
+        )
+        toplevel = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=repo_root,
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if (
+            head.returncode == 0 and toplevel.returncode == 0
+            and Path(toplevel.stdout.strip()).resolve() == repo_root.resolve()
+        ):
+            commit = head.stdout.strip()
+            diff = subprocess.run(
+                ["git", "diff", "--quiet", "HEAD", "--", str(script_path)],
+                cwd=repo_root, timeout=timeout,
+            )
+            # Anything other than a clean 0/1 (git error, ambiguous pathspec)
+            # is unknown, not "dirty".
+            dirty = {0: False, 1: True}.get(diff.returncode)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return {"commit": commit, "commit_dirty": dirty, "build_digest_sha256": build_digest}
+
+
+def build_fingerprint(
+    *, script_path: Path, repo_root: Path, denylist_path: Path | None,
+    project_metadata_path: Path | None, config_path: Path,
+    allowlist_path: Path | None, lexicon_dir: Path,
+) -> dict:
+    """Hashes of the exact code, denylist, project metadata, config,
+    allowlist, and lexicons used to produce a report. Never reads a file's
+    content into the return value or a log, only its hash."""
+
+    def hash_if_present(path: Path | None) -> str | None:
+        return sha256_file(path) if path and path.is_file() else None
+
+    return {
+        "code": code_identity(script_path, repo_root),
+        "denylist_sha256": hash_if_present(denylist_path),
+        "project_metadata_sha256": hash_if_present(project_metadata_path),
+        "config_sha256": sha256_file(config_path),
+        "allowlist_sha256": hash_if_present(allowlist_path),
+        "lexicon_sha256": {
+            name: sha256_file(lexicon_dir / name)
+            for name in LEXICON_FILENAMES
+            if (lexicon_dir / name).is_file()
+        },
+    }
 
 
 def redactable_phrase(value: str, *, allow_short: bool = False) -> bool:
@@ -2306,7 +2377,33 @@ def inputs_from_args(values: Sequence[str]) -> Iterator[Path]:
             yield path
 
 
-def parse_args() -> argparse.Namespace:
+def build_run_payload(reports: list[dict], fingerprint: dict, ner_enabled: bool) -> dict:
+    all_automated_checks_pass = all(
+        report["release_status"] == RELEASE_STATUS_AUTOMATED_PASS for report in reports
+    )
+    payload = {
+        "schema_version": 3,
+        "documents": reports,
+        "all_automated_checks_pass": all_automated_checks_pass,
+        "release_status": derive_release_status(
+            RELEASE_STATUS_AUTOMATED_PASS if all_automated_checks_pass else RELEASE_STATUS_FAIL,
+        ),
+        "fingerprint": fingerprint,
+        "notes": [
+            "The report contains counts, categories, page numbers, masked shapes, and hashes only.",
+            "Residual triage crops under the output triage/ directory contain original page regions; treat them as NDA material and delete after review.",
+            "Automated checks do not guarantee NDA compliance.",
+            "An NDA-authorized person must visually review every page locally before any AI submission.",
+        ],
+    }
+    if ner_enabled:
+        payload["notes"].append(
+            "NER review findings are report-only candidates for human triage; they never change automated checks."
+        )
+    return payload
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sanitize construction PDFs entirely on the local machine")
     parser.add_argument("inputs", nargs="+", help="PDF files or directories")
     parser.add_argument("--output-dir", type=Path, default=Path("output/pdf"))
@@ -2334,11 +2431,11 @@ def parse_args() -> argparse.Namespace:
         "--ner-report", action="store_true",
         help="run the local NER review layer for this run (report-only; requires the local model)",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
     sources = list(inputs_from_args(args.inputs))
     if not sources:
         raise SystemExit("No PDF inputs found")
@@ -2361,7 +2458,8 @@ def main() -> int:
     denylist: set[str] = set()
     if args.project_metadata:
         denylist |= load_project_metadata(args.project_metadata)
-    if args.denylist.is_file() or not denylist:
+    denylist_file_present = args.denylist.is_file()
+    if denylist_file_present or not denylist:
         denylist |= load_denylist(args.denylist)
     if not denylist:
         raise SystemExit("No denylist terms are available; supply --denylist or --project-metadata")
@@ -2386,27 +2484,16 @@ def main() -> int:
     except PageProcessingError as exc:
         print(f"Processing stopped at page {exc.page_number}: {exc.reason}; no page content displayed", file=sys.stderr)
         return 3
-    all_automated_checks_pass = all(
-        report["release_status"] == RELEASE_STATUS_AUTOMATED_PASS for report in reports
+    fingerprint = build_fingerprint(
+        script_path=Path(__file__),
+        repo_root=Path(__file__).resolve().parent.parent,
+        denylist_path=args.denylist if denylist_file_present else None,
+        project_metadata_path=args.project_metadata,
+        config_path=args.config,
+        allowlist_path=args.allowlist,
+        lexicon_dir=args.lexicons,
     )
-    payload = {
-        "schema_version": 2,
-        "documents": reports,
-        "all_automated_checks_pass": all_automated_checks_pass,
-        "release_status": derive_release_status(
-            RELEASE_STATUS_AUTOMATED_PASS if all_automated_checks_pass else RELEASE_STATUS_FAIL,
-        ),
-        "notes": [
-            "The report contains counts, categories, page numbers, masked shapes, and hashes only.",
-            "Residual triage crops under the output triage/ directory contain original page regions; treat them as NDA material and delete after review.",
-            "Automated checks do not guarantee NDA compliance.",
-            "An NDA-authorized person must visually review every page locally before any AI submission.",
-        ],
-    }
-    if ner_detector is not None:
-        payload["notes"].append(
-            "NER review findings are report-only candidates for human triage; they never change automated checks."
-        )
+    payload = build_run_payload(reports, fingerprint, ner_detector is not None)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({
