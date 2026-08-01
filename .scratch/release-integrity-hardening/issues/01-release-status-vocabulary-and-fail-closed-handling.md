@@ -17,22 +17,22 @@ blocking the push on either's failure.
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Per-document and overall-run reports use `release_status` with one of
+- [x] Per-document and overall-run reports use `release_status` with one of
       exactly `AUTOMATED_PASS`/`REVIEW_REQUIRED`/`REVIEW_INCOMPLETE`/`FAIL`/
       `RELEASED`; no code path can still produce the old `PASS`/
       `HUMAN_VISUAL_REVIEW_REQUIRED` strings.
-- [ ] `AUTOMATED_PASS` is documented and treated in code as non-terminal —
+- [x] `AUTOMATED_PASS` is documented and treated in code as non-terminal —
       nothing downstream reads it as "safe to ship."
-- [ ] A synthetic encrypted PDF run produces `release_status FAIL` with an
+- [x] A synthetic encrypted PDF run produces `release_status FAIL` with an
       explanatory message naming encryption as the cause; no traceback, no
       password prompt, no decryption code path anywhere in the tool.
-- [ ] A forced Tesseract call exceeding 120 seconds (mocked) fails that page
+- [x] A forced Tesseract call exceeding 120 seconds (mocked) fails that page
       in a controlled way rather than hanging.
-- [ ] A forced Ghostscript call exceeding 30 minutes (mocked) fails the run in
+- [x] A forced Ghostscript call exceeding 30 minutes (mocked) fails the run in
       a controlled way rather than hanging.
-- [ ] `git push` runs the full unit suite and `tools/eval_sanitizer.py` via a
+- [x] `git push` runs the full unit suite and `tools/eval_sanitizer.py` via a
       pre-push hook and is blocked on failure of either.
-- [ ] New behavior is covered by tests following the existing
+- [x] New behavior is covered by tests following the existing
       synthetic-PDF-in-memory pattern in `tests/test_anonymize_construction_pdfs.py`.
