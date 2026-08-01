@@ -19,23 +19,23 @@ identifying detail.
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `ocr_detection_boxes()` (or its replacement) accepts lexicons and
+- [x] `ocr_detection_boxes()` (or its replacement) accepts lexicons and
       applies `candidate_suppression()` and label-following-line logic
       identically to the vector path.
-- [ ] A parity test feeds equivalent sensitive/suppressible content through
+- [x] A parity test feeds equivalent sensitive/suppressible content through
       vector text and scanned images and asserts equivalent candidate/policy
       decisions.
-- [ ] A synthetic run with one page carrying a suppressible false positive on
+- [x] A synthetic run with one page carrying a suppressible false positive on
       the raster path completes with only that page marked failed/
       `REVIEW_REQUIRED` — the run does not abort.
-- [ ] A mixed page (some vector text, some sensitive content inside an
+- [x] A mixed page (some vector text, some sensitive content inside an
       embedded image) is no longer classified as pure "searchable," and its
       embedded-image content is proven redacted.
-- [ ] The old `min_text_chars` flat-threshold classification is gone; a
+- [x] The old `min_text_chars` flat-threshold classification is gone; a
       documented replacement rule accounts for raster/image content ratio.
-- [ ] A synthetic architect-of-record stamp (firm name + city/state) is
+- [x] A synthetic architect-of-record stamp (firm name + city/state) is
       proven redacted by default without an explicit per-run denylist entry.
 
 **Comments**

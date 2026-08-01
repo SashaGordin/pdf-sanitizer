@@ -209,17 +209,30 @@ CPU inference on a 1,475-page document takes tens of minutes.
 - Text redactions use MuPDF's destructive redaction engine.
 - Metadata, XMP, bookmarks, JavaScript, annotations, links, form fields,
   attachments, thumbnails, hidden text, and response data are scrubbed.
+- A page is routed to the raster path if it has too little vector text to
+  trust on its own (`min_vector_text_chars`, default 20) OR its embedded
+  raster images cover at least `raster_image_area_ratio` of the page (default
+  2%) — a mixed page (ordinary vector technical text plus a full-page or
+  large embedded image) is no longer classified as pure "searchable" and
+  skipped; its image content is inspected the same way a fully scanned page
+  is. This replaces a flat vector-character-count threshold that a mixed
+  page could slip past uninspected.
 - Every searchable page is locally vector-flattened with Ghostscript to remove
   optional-content layers while retaining text. MuPDF is the secondary vector
   backend; if both safe flattening paths fail, the page is rasterized locally.
 - Scanned/rasterized pages are OCRed locally, redacted as images, OCRed again,
-  and rebuilt using only the sanitized second OCR pass as the text layer.
+  and rebuilt using only the sanitized second OCR pass as the text layer. The
+  raster OCR pass applies the same lexicon suppression and label-following
+  lookahead as the vector path, so both paths enforce one policy.
 - After flattening, the assembled output is scanned and redacted a second
   time (post-flatten sweep): flattening rewrites content streams, so text can
   extract differently afterwards, and verification must only ever see a text
   stream a detector has already swept.
 - A failed page stops the run and reports only its page number and failure
-  category.
+  category — except a suppressible false positive surviving the raster
+  path's post-redaction safety check, which fails only that page
+  (`raster_page_failures` in the report; the whole rendered page is blackened
+  and its OCR text layer is not reinserted) rather than aborting the run.
 - Temporary directories use neutral names under `tmp/pdfs/` and are deleted
   automatically.
 

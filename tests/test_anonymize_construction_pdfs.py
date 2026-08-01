@@ -128,6 +128,69 @@ def create_scanned_pdf(path: Path) -> None:
     scan.close()
 
 
+def create_scanned_pdf_pages(path: Path, pages: list[list[str]]) -> None:
+    """Multi-page scanned/rasterized PDF: each page is one full-page image
+    baking in that page's lines. Generalizes create_scanned_pdf to accept
+    per-page line lists (needed by parity and per-page-containment tests)."""
+    scan = fitz.open()
+    for page_index, lines in enumerate(pages):
+        vector = path.with_suffix(f".vector{page_index}.pdf")
+        pdf = canvas.Canvas(str(vector), pagesize=letter)
+        pdf.setFont("Helvetica", 20)
+        y = 700
+        for line in lines:
+            pdf.drawString(45, y, line)
+            # Wide enough that a redaction box's own quiet-zone padding
+            # (apply_image_boxes pads ~18% of a box's own width/height in
+            # every direction) can never bleed vertically into the next
+            # line, even when this line is a long denylist/address match.
+            y -= 150
+        pdf.save()
+        doc = fitz.open(vector)
+        pix = doc[0].get_pixmap(matrix=fitz.Matrix(200 / 72, 200 / 72), colorspace=fitz.csRGB)
+        image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        doc.close()
+        vector.unlink()
+        buffer = tempfile.SpooledTemporaryFile()
+        image.save(buffer, format="PNG", dpi=(200, 200))
+        buffer.seek(0)
+        page = scan.new_page(width=letter[0], height=letter[1])
+        page.insert_image(page.rect, stream=buffer.read())
+        buffer.close()
+    scan.save(path)
+    scan.close()
+
+
+def render_stamp_image(
+    path: Path, lines: list[str], canvas_size: tuple[float, float] = (300, 260),
+    font_size: int = 22, dpi: int = 200,
+) -> bytes:
+    """PNG bytes baking in `lines` onto a small canvas, via the same
+    vector-canvas -> fitz pixmap -> PIL pipeline create_scanned_pdf uses,
+    generalized so a caller can place the result as one embedded image on an
+    otherwise-vector page. `path` is scratch space only."""
+    vector = path.with_suffix(".stamp.pdf")
+    pdf = canvas.Canvas(str(vector), pagesize=canvas_size)
+    pdf.setFont("Helvetica", font_size)
+    y = canvas_size[1] - font_size * 1.8
+    for line in lines:
+        pdf.drawString(10, y, line)
+        y -= font_size * 1.8
+    pdf.save()
+    doc = fitz.open(vector)
+    scale = dpi / 72
+    pix = doc[0].get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB)
+    image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    doc.close()
+    vector.unlink()
+    buffer = tempfile.SpooledTemporaryFile()
+    image.save(buffer, format="PNG", dpi=(dpi, dpi))
+    buffer.seek(0)
+    data = buffer.read()
+    buffer.close()
+    return data
+
+
 def create_cross_line_pdf(path: Path) -> None:
     """Shapes mirroring the audit's masked real-run residuals: label/value,
     label-alone/value, name/credential, and wrapped phrases split across
@@ -190,7 +253,7 @@ class SanitizerTests(unittest.TestCase):
         self.settings = sanitizer.Settings(
             ocr_dpi=220,
             barcode_dpi=72,
-            min_text_chars=20,
+            min_vector_text_chars=20,
             progress_every_pages=0,
             detect_barcodes=True,
             redact_repeated_margin_images=False,
@@ -1035,6 +1098,248 @@ class SuppressionSymmetryTest(unittest.TestCase):
         # The pre-lexicon behaviour: table content eaten by the address regex.
         self.assertNotIn("BASKETBALL COURT", text)
         self.assertNotIn("Sycamore", text)
+
+
+class RasterVectorParityTest(unittest.TestCase):
+    """The same suppressible false positive and the same genuine identifier
+    must reach the same verdict whether the page is vector text or a
+    full-page scan — proving ocr_detection_boxes() now enforces the same
+    lexicon-suppression policy as line_detections(), not a stricter/blinder
+    one. "3 CIR" is caught by the street_address direct pattern (its "Cir"
+    abbreviation) on both paths, then must be suppressed by the
+    panel_circuit_reference structural rule on both paths too."""
+
+    LINES = ("OWNER: Fictional Owner Holdings", "3 CIR")
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.settings = sanitizer.Settings(
+            ocr_dpi=220, barcode_dpi=120, progress_every_pages=0,
+            detect_barcodes=False, redact_repeated_margin_images=False,
+        )
+        self.lex = sanitizer.load_lexicons(REPO_LEXICONS, REPO_ALLOWLIST)
+
+    def run_on(self, source: Path) -> tuple[dict, str]:
+        destination = self.root / f"{source.stem}_out.pdf"
+        report = sanitizer.sanitize_document(
+            source, destination, source.stem, FAKE_TERMS, self.settings, self.root,
+            lexicons=self.lex,
+        )
+        output = fitz.open(destination)
+        text = output[0].get_text("text")
+        output.close()
+        return report, text
+
+    def test_vector_and_scanned_pages_reach_the_same_verdict(self) -> None:
+        vector_source = self.root / "vector.pdf"
+        pdf = canvas.Canvas(str(vector_source), pagesize=letter)
+        pdf.setFont("Helvetica", 12)
+        y = 700
+        for line in self.LINES:
+            pdf.drawString(45, y, line)
+            y -= 24
+        pdf.showPage()
+        pdf.save()
+
+        scanned_source = self.root / "scanned.pdf"
+        create_scanned_pdf_pages(scanned_source, [list(self.LINES)])
+
+        vector_report, vector_text = self.run_on(vector_source)
+        scanned_report, scanned_text = self.run_on(scanned_source)
+
+        for report in (vector_report, scanned_report):
+            self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
+        for text in (vector_text, scanned_text):
+            self.assertIn("3 CIR", text)
+            self.assertNotIn("Fictional Owner Holdings", text)
+        self.assertEqual(scanned_report["rasterized_pages"], [1])
+
+
+class RasterClassificationTest(unittest.TestCase):
+    """Direct tests of page_needs_raster_pass(), the min_text_chars
+    replacement — no PDF needed."""
+
+    def test_low_text_and_no_image_needs_raster(self) -> None:
+        settings = sanitizer.Settings()
+        self.assertTrue(sanitizer.page_needs_raster_pass(5, 0.0, settings))
+
+    def test_ample_text_and_small_image_stays_vector(self) -> None:
+        settings = sanitizer.Settings()
+        self.assertFalse(sanitizer.page_needs_raster_pass(500, 0.01, settings))
+
+    def test_ample_text_and_large_image_needs_raster(self) -> None:
+        settings = sanitizer.Settings()
+        self.assertTrue(sanitizer.page_needs_raster_pass(500, 0.02, settings))
+        self.assertTrue(sanitizer.page_needs_raster_pass(500, 0.5, settings))
+
+    def test_min_text_chars_field_no_longer_exists(self) -> None:
+        with self.assertRaises(TypeError):
+            sanitizer.Settings(min_text_chars=20)
+
+
+class MixedPageRasterTest(unittest.TestCase):
+    """A page with a substantial vector-text body AND a large embedded image
+    is a mixed page: the image content must be inspected too, not skipped
+    because the vector text alone clears min_vector_text_chars."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.settings = sanitizer.Settings(
+            ocr_dpi=220, barcode_dpi=120, progress_every_pages=0,
+            detect_barcodes=False, redact_repeated_margin_images=False,
+        )
+        self.lex = sanitizer.load_lexicons(REPO_LEXICONS, REPO_ALLOWLIST)
+
+    def test_embedded_image_content_is_redacted_on_an_otherwise_vector_page(self) -> None:
+        source = self.root / "mixed.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=letter[0], height=letter[1])
+        page.insert_text((45, 700), "TECHNICAL: ASTM A36 structural steel; 2x6 studs at 16 inches O.C.")
+        stamp = render_stamp_image(self.root / "stamp", ["Fictional Owner Holdings"])
+        # 300x260pt on a letter page (612x792pt) is ~16% of page area, well
+        # above the 2% raster_image_area_ratio default.
+        page.insert_image(fitz.Rect(150, 300, 450, 560), stream=stamp)
+        doc.save(source)
+        doc.close()
+
+        destination = self.root / "out.pdf"
+        report = sanitizer.sanitize_document(
+            source, destination, "doc", FAKE_TERMS, self.settings, self.root,
+            lexicons=self.lex,
+        )
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
+        self.assertEqual(report["rasterized_pages"], [1])
+        output = fitz.open(destination)
+        text = output[0].get_text("text")
+        output.close()
+        self.assertNotIn("Fictional Owner Holdings", text)
+        self.assertIn("ASTM A36", text)
+        raw = destination.read_bytes().lower()
+        self.assertNotIn(b"fictional owner holdings", raw)
+
+
+class RasterFailureContainmentTest(unittest.TestCase):
+    """A suppressible false positive discovered only by the raster path's
+    post-redaction safety check must fail just that page, not abort the
+    whole run. Every other raster failure mode (missing OCR executable,
+    tesseract/ghostscript timeouts) is covered by the three pre-existing
+    tests in SanitizerTests and is not re-tested here."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.settings = sanitizer.Settings(
+            ocr_dpi=220, barcode_dpi=120, progress_every_pages=0,
+            detect_barcodes=False, redact_repeated_margin_images=False,
+        )
+
+    def test_only_the_affected_page_fails_and_the_run_does_not_abort(self) -> None:
+        source = self.root / "two_page_scan.pdf"
+        create_scanned_pdf_pages(source, [
+            ["OWNER: Fictional Owner Holdings", "TECHNICAL: gypsum board note"],
+            ["TECHNICAL: page two rebar note"],
+        ])
+        real_ocr_detection_boxes = sanitizer.ocr_detection_boxes
+        residual_checks = {"count": 0}
+
+        def fake_ocr_detection_boxes(
+            words, denylist, lexicons=None, scale=1.0,
+            suppressed_counts=None, suppressed_categories=None,
+        ):
+            result = real_ocr_detection_boxes(
+                words, denylist, lexicons, scale, suppressed_counts, suppressed_categories,
+            )
+            # The pre-redaction detection call always passes the document's
+            # suppression counters; only the post-redaction residual-check
+            # call (raster_page_pdf's second ocr_detection_boxes call)
+            # leaves both at their None default — the deterministic seam
+            # that distinguishes the two calls without touching production
+            # code.
+            is_residual_check = suppressed_counts is None and suppressed_categories is None
+            if is_residual_check:
+                residual_checks["count"] += 1
+                if residual_checks["count"] == 2:  # page 2's residual check
+                    return [((0, 0, 10, 10), "labelled_identifier")]
+            return result
+
+        with mock.patch.object(sanitizer, "ocr_detection_boxes", side_effect=fake_ocr_detection_boxes):
+            destination = self.root / "out.pdf"
+            report = sanitizer.sanitize_document(
+                source, destination, "doc", FAKE_TERMS, self.settings, self.root,
+            )
+
+        self.assertEqual(
+            report["raster_page_failures"],
+            [{"page": 2, "reason": "residual identifier detected after raster redaction"}],
+        )
+        self.assertFalse(report["checks"]["raster_page_verification"])
+        self.assertNotEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
+        output = fitz.open(destination)
+        page1_text = output[0].get_text("text")
+        output.close()
+        self.assertNotIn("Fictional Owner Holdings", page1_text)
+        self.assertIn("gypsum", page1_text)
+
+
+class ArchitectOfRecordTest(unittest.TestCase):
+    """CONTEXT.md resolves architect-of-record disclosure as sensitive by
+    default: the firm's name and location must be redacted like any other
+    identifying detail, not preserved as an assumed-intentional disclosure.
+    This proves the *generic* label-following mechanism catches it — not a
+    per-run denylist entry, and not the same-line "Architect: <firm>" form
+    the vector path already handled before this ticket."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.settings = sanitizer.Settings(
+            ocr_dpi=220, barcode_dpi=120, progress_every_pages=0,
+            detect_barcodes=False, redact_repeated_margin_images=False,
+        )
+
+    def test_architect_of_record_stamp_is_redacted_without_a_denylist_entry(self) -> None:
+        source = self.root / "stamped.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=letter[0], height=letter[1])
+        page.insert_text((45, 700), "TECHNICAL: ASTM A36 structural steel")
+        stamp = render_stamp_image(self.root / "stamp", [
+            "ARCHITECT OF RECORD",
+            "Fakename Architecture Group",
+            # A non-real state abbreviation so the city_state_zip direct
+            # pattern doesn't independently fire — isolating the proof to
+            # the label-following mechanism, not a second detector.
+            "Someplace, ZZ 00000",
+        ])
+        # 300x260pt on a letter page is ~16% of page area, well above the 2%
+        # raster_image_area_ratio default.
+        page.insert_image(fitz.Rect(150, 300, 450, 560), stream=stamp)
+        doc.save(source)
+        doc.close()
+
+        destination = self.root / "out.pdf"
+        lex = sanitizer.load_lexicons(REPO_LEXICONS, REPO_ALLOWLIST)
+        report = sanitizer.sanitize_document(
+            source, destination, "doc", FAKE_TERMS, self.settings, self.root,
+            lexicons=lex,
+        )
+        self.assertIn(1, report["rasterized_pages"])
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
+        output = fitz.open(destination)
+        text = output[0].get_text("text")
+        output.close()
+        folded = text.casefold()
+        self.assertNotIn("fakename architecture group", folded)
+        self.assertNotIn("someplace", folded)
+        self.assertIn("ASTM A36", text)
+        raw = destination.read_bytes().lower()
+        self.assertNotIn(b"fakename architecture group", raw)
+        self.assertNotIn(b"someplace", raw)
 
 
 if __name__ == "__main__":
