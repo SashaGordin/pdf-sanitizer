@@ -1,3 +1,34 @@
+## Project phase: development vs. production (read this first)
+
+**Right now: development phase.** The documents used to build and test this
+tool (e.g. the MLK Recreation Center corpus) are public information — see the
+`_about` note in `tests/golden/mlk_labels.json`. It is fine for Claude to
+read, open, and inspect these files directly, including their full content.
+
+**Production phase: no cloud access, anywhere, once this.** When this system
+is complete, finalized, and actually used to process real client files, the
+user switches to legitimate, NDA-protected, non-public documents. From that
+point on:
+
+- **The tool itself must run fully offline.** This is already the design
+  intent per `ANONYMIZATION.md` (the sanitizer refuses to run NER without a
+  local model directory, and never accesses the network at runtime) — that
+  property must hold for the whole pipeline, not just the NER step, and must
+  not regress.
+- **Claude/Claude Code must not read real client file content.** Once real
+  client PDFs, extracted text, or sanitizer output are in play, do not `Read`
+  their content, paste it into a conversation, or otherwise send it to any
+  cloud API (Claude or otherwise) — that defeats the purpose of the tool,
+  which exists specifically to keep this data from leaving the machine.
+  Filenames, file sizes, config, code, and test/golden-fixture data (already
+  public) remain fine to inspect at any time.
+- If asked to debug an issue that only reproduces on a real client document,
+  say so explicitly and ask the user how they want to proceed (e.g. a
+  redacted/synthetic repro) rather than reading the file.
+
+If it's unclear which phase the project is in, ask before opening any file
+that isn't clearly public/synthetic (config, code, and docs are always safe).
+
 ## Imported Claude Cowork project instructions
 
 ## Local-only assets (not in git)
