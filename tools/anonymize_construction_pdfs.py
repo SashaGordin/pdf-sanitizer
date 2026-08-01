@@ -99,7 +99,7 @@ DIRECT_PATTERNS: dict[str, re.Pattern[str]] = {
 }
 
 LABEL_NAME = (
-    r"owner|client|tenant|architect|engineer|engineering|designer|design firm|"
+    r"owner|client|tenant|architect(?: of record)?|engineer|engineering|designer|design firm|"
     r"consultant|contractor|construction manager|developer|vendor|prepared by|"
     r"submitted by|drawn by|checked by|approved by|contact|project(?: name)?|"
     r"property(?: name)?|project location|site address|address|facility|"
@@ -720,7 +720,8 @@ class Settings:
     ocr_dpi: int = 300
     barcode_dpi: int = 120
     barcode_max_dimension: int = 2400
-    min_text_chars: int = 20
+    min_vector_text_chars: int = 20
+    raster_image_area_ratio: float = 0.02
     progress_every_pages: int = 100
     tesseract_executable: str = "tesseract"
     ghostscript_executable: str = "gs"
@@ -1036,7 +1037,8 @@ def load_settings(path: Path) -> Settings:
         ocr_dpi=int(raw.get("ocr_dpi", 300)),
         barcode_dpi=int(raw.get("barcode_dpi", 120)),
         barcode_max_dimension=int(raw.get("barcode_max_dimension", 2400)),
-        min_text_chars=int(raw.get("min_text_chars", 20)),
+        min_vector_text_chars=int(raw.get("min_vector_text_chars", 20)),
+        raster_image_area_ratio=float(raw.get("raster_image_area_ratio", 0.02)),
         progress_every_pages=int(raw.get("progress_every_pages", 100)),
         tesseract_executable=str(raw.get("tesseract_executable", "tesseract")),
         ghostscript_executable=str(raw.get("ghostscript_executable", "gs")),
@@ -1283,6 +1285,32 @@ def repeated_margin_images(
     return result, complex_pages
 
 
+def page_raster_ratio(page: fitz.Page) -> float:
+    """Fraction of the page area covered by displayed raster images."""
+    page_area = page.rect.width * page.rect.height
+    if not page_area:
+        return 0.0
+    # Same one-traversal idiom repeated_margin_images() uses, rather than
+    # get_images()/get_image_rects() repeatedly walking nested form resources.
+    covered = 0.0
+    for info in page.get_image_info(hashes=False, xrefs=True):
+        rect = fitz.Rect(info["bbox"])
+        covered += rect.width * rect.height
+    return covered / page_area
+
+
+def page_needs_raster_pass(text_length: int, raster_ratio: float, settings: Settings) -> bool:
+    """Replaces the flat min_text_chars threshold. True if the page has too
+    little vector text to trust on its own, OR carries enough embedded
+    raster-image area that sensitive content could be hiding in pixels the
+    vector path never inspects — the mixed-page case a flat character count
+    always missed."""
+    return (
+        text_length < settings.min_vector_text_chars
+        or raster_ratio >= settings.raster_image_area_ratio
+    )
+
+
 def configured_page_rects(settings: Settings, page: fitz.Page, page_number: int) -> list[tuple[fitz.Rect, str]]:
     result: list[tuple[fitz.Rect, str]] = []
     for region in settings.regions:
@@ -1492,7 +1520,33 @@ def ocr_lines(words: Sequence[OcrWord]) -> list[tuple[str, list[OcrWord]]]:
     for grouped in groups.values():
         grouped.sort(key=lambda word: word.left)
         result.append((" ".join(word.text for word in grouped), grouped))
+    # Tesseract runs with --psm 11 ("sparse text... no particular order"), so
+    # unlike lines_from_page() this has no inherent top-to-bottom guarantee —
+    # required by following_value_ocr_lines()'s "next line(s) below" rule.
+    result.sort(key=lambda item: (min(word.top for word in item[1]), min(word.left for word in item[1])))
     return result
+
+
+def following_value_ocr_lines(
+    ordered_lines: Sequence[tuple[str, list[OcrWord]]], index: int, scale: float,
+) -> Iterator[tuple[str, list[OcrWord]]]:
+    """Value lines that belong to a label-only OCR line — the pixel-space
+    analog of following_value_lines() for the raster path. `scale` converts
+    the vector path's 120-point vertical-gap cutoff into pixels (pixels per
+    point == settings.ocr_dpi / 72, the same ratio page_image() returns)."""
+    _, label_words = ordered_lines[index]
+    label_bottom = max(word.top + word.height for word in label_words)
+    for following_text, following_words in ordered_lines[index + 1:index + 4]:
+        following_top = min(word.top for word in following_words)
+        if following_top - label_bottom > 120 * scale:
+            break
+        candidate = normalized(following_text)
+        if (
+            redactable_phrase(candidate, allow_short=True)
+            and len(candidate.split()) <= 10
+            and not LABEL_RE.match(candidate)
+        ):
+            yield following_text, following_words
 
 
 def ocr_span_box(words: Sequence[OcrWord], text: str, start: int, end: int) -> tuple[int, int, int, int]:
@@ -1551,23 +1605,88 @@ def ocr_boxes_for_span(paragraph: OcrParagraph, start: int, end: int) -> list[tu
     return boxes
 
 
-def ocr_detection_boxes(words: Sequence[OcrWord], denylist: DenylistMatcher) -> list[tuple[tuple[int, int, int, int], str]]:
+def ocr_detection_boxes(
+    words: Sequence[OcrWord],
+    denylist: DenylistMatcher,
+    lexicons: Lexicons | None = None,
+    scale: float = 1.0,
+    suppressed_counts: collections.Counter[str] | None = None,
+    suppressed_categories: collections.Counter[str] | None = None,
+) -> list[tuple[tuple[int, int, int, int], str]]:
+    """Raster-path parity with line_detections(): same lexicon suppression
+    and label-following-line lookahead, so both paths enforce one policy.
+
+    Table-cell-crossing suppression is deliberately not threaded in: a
+    rasterized page has no vector table geometry (find_tables()) for a match
+    to cross, so line_detections()'s crossings() check has nothing to
+    operate on here.
+    """
     # Paragraph-level scanning mirrors the vector path's block-level
     # scanning, so the raster fallback has the same cross-line recall.
     results: list[tuple[tuple[int, int, int, int], str]] = []
     for paragraph in ocr_paragraphs(words):
         for category, pattern in DIRECT_PATTERNS.items():
             for match in pattern.finditer(paragraph.text):
+                matched = match.group()
+                suppressed = candidate_suppression(
+                    category, matched, lexicons,
+                    context=containing_line(paragraph.text, match.start(), match.end()),
+                )
+                if suppressed:
+                    if suppressed_counts is not None:
+                        suppressed_counts[suppressed.split(":")[0]] += 1
+                    if suppressed_categories is not None:
+                        suppressed_categories[category] += 1
+                    continue
                 for box in ocr_boxes_for_span(paragraph, match.start(), match.end()):
                     results.append((box, category))
         for denylist_match in denylist.finditer(paragraph.text):
+            matched = denylist_match.group()
+            suppressed = candidate_suppression(
+                "denylist", matched, lexicons,
+                context=containing_line(paragraph.text, denylist_match.start(), denylist_match.end()),
+            )
+            if suppressed:
+                if suppressed_counts is not None:
+                    suppressed_counts[suppressed.split(":")[0]] += 1
+                if suppressed_categories is not None:
+                    suppressed_categories["denylist"] += 1
+                continue
             for box in ocr_boxes_for_span(paragraph, denylist_match.start(), denylist_match.end()):
                 results.append((box, "denylist"))
         for segment_start, segment_end, line_words in paragraph.segments:
             text = paragraph.text[segment_start:segment_end]
             match = LABEL_VALUE_RE.match(text)
             if match:
+                value = match.group(1)
+                suppressed = candidate_suppression("labelled_identifier", value, lexicons, context=text)
+                if suppressed:
+                    if suppressed_counts is not None:
+                        suppressed_counts[suppressed.split(":")[0]] += 1
+                    if suppressed_categories is not None:
+                        suppressed_categories["labelled_identifier"] += 1
+                    continue
                 results.append((ocr_span_box(line_words, text, match.start(1), match.end(1)), "labelled_identifier"))
+    # A label alone on its line labels the following lines — the raster-path
+    # analog of line_detections()'s LABEL_RE branch.
+    ordered_lines = ocr_lines(words)
+    for index, (text, _line_words) in enumerate(ordered_lines):
+        if not LABEL_RE.match(normalized(text)):
+            continue
+        for value_text, value_words in following_value_ocr_lines(ordered_lines, index, scale):
+            suppressed = candidate_suppression("labelled_identifier", value_text, lexicons, context=value_text)
+            if suppressed:
+                if suppressed_counts is not None:
+                    suppressed_counts[suppressed.split(":")[0]] += 1
+                if suppressed_categories is not None:
+                    suppressed_categories["labelled_identifier"] += 1
+                continue
+            box = (
+                min(word.left for word in value_words), min(word.top for word in value_words),
+                max(word.left + word.width for word in value_words),
+                max(word.top + word.height for word in value_words),
+            )
+            results.append((box, "labelled_identifier"))
     return results
 
 
@@ -1586,11 +1705,16 @@ def raster_page_pdf(
     denylist: DenylistMatcher,
     temp_dir: Path,
     categories: set[str],
-) -> bytes:
+    lexicons: Lexicons | None = None,
+    suppressed_counts: collections.Counter[str] | None = None,
+    suppressed_categories: collections.Counter[str] | None = None,
+) -> tuple[bytes, str | None]:
     try:
         image, scale = page_image(page, settings.ocr_dpi)
         first_words = run_tesseract_tsv(image, settings, temp_dir)
-        detections = ocr_detection_boxes(first_words, denylist)
+        detections = ocr_detection_boxes(
+            first_words, denylist, lexicons, scale, suppressed_counts, suppressed_categories,
+        )
         boxes = [box for box, category in detections]
         categories.update(category for box, category in detections)
         if settings.detect_barcodes:
@@ -1614,30 +1738,45 @@ def raster_page_pdf(
             else:
                 raise RuntimeError("residual barcode detected after raster redaction")
         sanitized_words = run_tesseract_tsv(image, settings, temp_dir)
-        if ocr_detection_boxes(sanitized_words, denylist):
-            raise RuntimeError("residual identifier detected after raster redaction")
+        # Internal safety verification, not a second detection pass whose
+        # suppressions need independent audit-counting — no counters passed,
+        # mirroring how the vector path's own second pass
+        # (sweep_flattened_output) keeps a separate sweep_suppressed counter
+        # rather than sharing the first pass's.
+        failure_reason: str | None = None
+        if ocr_detection_boxes(sanitized_words, denylist, lexicons, scale):
+            # Fails only this page rather than aborting the whole run (see
+            # the PageProcessingError re-raise below and the caller in
+            # sanitize_document). Blacken the entire rendered page rather
+            # than trust the specific boxes this safety check found, and
+            # skip reinserting the OCR text layer below — invisible-but-
+            # copyable text over pixels that could not be confirmed clean
+            # would defeat the point of failing closed.
+            apply_image_boxes(image, [(0, 0, image.width, image.height)])
+            failure_reason = "residual identifier detected after raster redaction"
         output = fitz.open()
         out_page = output.new_page(width=page.rect.width, height=page.rect.height)
         buffer = io.BytesIO()
         image.save(buffer, format="PNG", dpi=(settings.ocr_dpi, settings.ocr_dpi), optimize=True)
         out_page.insert_image(out_page.rect, stream=buffer.getvalue())
-        for text, line_words in ocr_lines(sanitized_words):
-            left = min(word.left for word in line_words) / scale
-            top = min(word.top for word in line_words) / scale
-            right = max(word.left + word.width for word in line_words) / scale
-            bottom = max(word.top + word.height for word in line_words) / scale
-            rect = fitz.Rect(left, top, right, bottom)
-            font_size = max(3.0, rect.height * 0.82)
-            # A baseline insertion always creates the sanitized text item and
-            # keeps each OCR line searchable as a phrase.
-            out_page.insert_text(
-                (rect.x0, max(rect.y0 + font_size, rect.y1 - 0.5)),
-                text, fontsize=font_size, fontname="helv", render_mode=3, overlay=True,
-            )
+        if failure_reason is None:
+            for text, line_words in ocr_lines(sanitized_words):
+                left = min(word.left for word in line_words) / scale
+                top = min(word.top for word in line_words) / scale
+                right = max(word.left + word.width for word in line_words) / scale
+                bottom = max(word.top + word.height for word in line_words) / scale
+                rect = fitz.Rect(left, top, right, bottom)
+                font_size = max(3.0, rect.height * 0.82)
+                # A baseline insertion always creates the sanitized text item and
+                # keeps each OCR line searchable as a phrase.
+                out_page.insert_text(
+                    (rect.x0, max(rect.y0 + font_size, rect.y1 - 0.5)),
+                    text, fontsize=font_size, fontname="helv", render_mode=3, overlay=True,
+                )
         output.set_metadata({})
         data = output.tobytes(garbage=4, clean=True, deflate=True)
         output.close()
-        return data
+        return data, failure_reason
     except PageProcessingError:
         raise
     except Exception as exc:
@@ -1975,6 +2114,7 @@ def verify_output(
     triage_dir: Path,
     ner_detector: NerDetector | None = None,
     lexicons: Lexicons | None = None,
+    raster_page_failures: Sequence[dict] = (),
 ) -> dict:
     doc = fitz.open(destination)
     residual_counts: collections.Counter[str] = collections.Counter()
@@ -2123,7 +2263,7 @@ def verify_output(
         "bookmarks_empty": not doc.get_toc(simple=True),
         "attachments_empty": not doc.embfile_names(),
         "optional_content_groups_empty": not doc.get_ocgs(),
-        "raster_ocr_from_sanitized_images_only": True,
+        "raster_page_verification": not raster_page_failures,
     }
     doc.close()
     result = {
@@ -2137,6 +2277,7 @@ def verify_output(
         "blank_render_pages": blank_render_pages,
         "interactive_pages": interactive_pages,
         "rasterized_pages": sorted(raster_pages),
+        "raster_page_failures": list(raster_page_failures),
         "release_status": automated_gate_status(checks),
     }
     if ner_detector is not None:
@@ -2203,6 +2344,7 @@ def sanitize_document(
         margin_images, image_complexity_pages = {}, set()
     page_categories: dict[int, set[str]] = collections.defaultdict(set)
     raster_required: set[int] = set(image_complexity_pages)
+    raster_page_failures: list[dict] = []
     rule_counts: collections.Counter[str] = collections.Counter()
     suppressed_counts: collections.Counter[str] = collections.Counter()
     suppressed_categories: collections.Counter[str] = collections.Counter()
@@ -2214,7 +2356,8 @@ def sanitize_document(
             if page_number in raster_required:
                 continue
             lines = lines_from_page(page)
-            if len(normalized(" ".join(line.text for line in lines))) < settings.min_text_chars:
+            text_length = len(normalized(" ".join(line.text for line in lines)))
+            if page_needs_raster_pass(text_length, page_raster_ratio(page), settings):
                 raster_required.add(page_number)
                 continue
             zone = csi_zone_for_page(
@@ -2316,7 +2459,12 @@ def sanitize_document(
                     continue
                 except Exception:
                     raster_required.add(page_number)
-            page_pdf = raster_page_pdf(page, settings, matcher, temp_dir, page_categories[page_number])
+            page_pdf, failure_reason = raster_page_pdf(
+                page, settings, matcher, temp_dir, page_categories[page_number],
+                lexicons, suppressed_counts, suppressed_categories,
+            )
+            if failure_reason is not None:
+                raster_page_failures.append({"page": page_number, "reason": failure_reason})
             raster_doc = fitz.open("pdf", page_pdf)
             output.insert_pdf(raster_doc)
             raster_doc.close()
@@ -2347,6 +2495,7 @@ def sanitize_document(
         destination, source_sizes, matcher, raster_required,
         destination.parent / "triage" / document_id,
         ner_detector=ner_detector, lexicons=lexicons,
+        raster_page_failures=raster_page_failures,
     )
     return {
         "document_id": document_id,
