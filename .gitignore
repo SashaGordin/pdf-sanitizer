@@ -23,5 +23,9 @@ output/
 # --- Scratch / intermediate working dirs ---
 tmp/
 
+# NOTE: .scratch/ is intentionally NOT ignored. It holds specs and issue
+# tickets (see docs/agents/issue-tracker.md) and is meant to be versioned
+# with the code it describes. Don't add it here out of habit.
+
 # --- macOS ---
 .DS_Store
