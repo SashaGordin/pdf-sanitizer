@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Throwaway prototype: opens the reviewer-triage web prototype (issue #7, Phase 4).
 
-Web-app iteration of tools/prototype_reviewer_triage.py, built after reacting
-to the CLI version: the CLI's text-prompt fidelity was too low to judge the
-reviewer workflow against, so this raises fidelity to a clickable page with
-three structurally different variants of the review screen (full-screen
-one-at-a-time stack, master-detail inbox, kanban board), switchable via
-?variant=A/B/C.
+Third iteration. After the CLI (too low fidelity to judge the workflow) and
+a 3-variant web comparison (full-screen stack / inbox / kanban board), the
+reaction was: inbox layout wins, but strip out anything a non-technical
+reviewer doesn't need -- no residual/NER labels, no occurrence counts or
+match scores, no denylist/lexicon/manifest previews. A reviewer's only job
+is "is this sensitive or not", with an optional free-text note; the four
+dispositions (sensitive/safe/duplicate/escalate) stay, just relabeled in
+plain language.
 
 Everything is client-side (synthetic findings baked into the HTML, matching
 the same residual/ner_review.findings shapes as the CLI's --demo mode) --
