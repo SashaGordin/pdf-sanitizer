@@ -2787,6 +2787,13 @@ def sanitize_document(
             raster_page_failures=raster_page_failures,
             settings=settings,
         )
+    # A value that only surfaced in final-output rendered OCR is exactly the
+    # finding ticket 05 requires to block AUTOMATED_PASS. Auto-patching it and
+    # re-verifying clean must not erase that: force this document to FAIL so a
+    # human always reviews the patched pages, regardless of how clean the
+    # second verification pass looks.
+    verification["checks"]["no_render_remediation_required"] = not rendered_output_remediation
+    verification["release_status"] = automated_gate_status(verification["checks"])
     return {
         "document_id": document_id,
         "source_sha256": sha256_file(source),

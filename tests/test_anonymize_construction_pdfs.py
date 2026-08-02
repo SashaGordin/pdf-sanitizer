@@ -285,6 +285,7 @@ class SanitizerTests(unittest.TestCase):
         create_searchable_pdf(source)
         destination, report = self.run_sanitizer(source)
         self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
+        self.assertTrue(report["checks"]["no_render_remediation_required"])
         self.assertIn("barcode_or_qr", {c for item in report["page_redactions"] for c in item["categories"]})
         output = fitz.open(destination)
         extracted = "\n".join(page.get_text("text") for page in output)
@@ -361,6 +362,22 @@ class SanitizerTests(unittest.TestCase):
         source_text = Path(sanitizer.__file__).read_text(encoding="utf-8")
         self.assertNotIn("--password", source_text)
         self.assertNotIn(".authenticate(", source_text)
+
+    def test_render_remediation_forces_fail_even_when_second_pass_is_clean(self) -> None:
+        # A value that only ever surfaced in final-output rendered OCR must
+        # never be allowed to reach AUTOMATED_PASS silently just because an
+        # automatic patch-and-reverify happened to leave the page clean.
+        source = self.root / "source.pdf"
+        create_searchable_pdf(source)
+        with mock.patch.object(
+            sanitizer, "remediate_rendered_output", return_value={1: ["denylist"]},
+        ):
+            destination, report = self.run_sanitizer(source)
+        self.assertFalse(report["checks"]["no_render_remediation_required"])
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_FAIL)
+        self.assertEqual(
+            report["rendered_output_remediation"], [{"page": 1, "categories": ["denylist"]}],
+        )
 
     def test_tesseract_timeout_fails_closed_per_page(self) -> None:
         source = self.root / "scan.pdf"
@@ -1777,6 +1794,33 @@ class RenderedPageOcrVerifierTest(unittest.TestCase):
         pages = report["rendered_ocr_verification"]["pages"]
         self.assertEqual([page["page"] for page in pages], [1, 2])
         self.assertTrue(all("elapsed_seconds" in page and "process_peak_rss_bytes" in page for page in pages))
+
+    def test_remediation_redacts_the_matched_region_and_reports_its_category(self) -> None:
+        path = self.make_pdf()
+        with mock.patch.object(
+            sanitizer, "run_tesseract_tsv",
+            side_effect=[self.words("Fictional", "Owner", "Holdings")],
+        ):
+            remediated = sanitizer.remediate_rendered_output(
+                path, {1},
+                sanitizer.DenylistMatcher({"Fictional Owner Holdings"}),
+                sanitizer.load_lexicons(REPO_LEXICONS, REPO_ALLOWLIST),
+                self.settings,
+            )
+        self.assertEqual(remediated, {1: ["denylist"]})
+        doc = fitz.open(path)
+        self.assertNotIn("Fictional Owner Holdings", doc[0].get_text("text"))
+        doc.close()
+
+    def test_remediation_is_a_noop_when_no_pages_are_unresolved(self) -> None:
+        path = self.make_pdf()
+        original_bytes = path.read_bytes()
+        remediated = sanitizer.remediate_rendered_output(
+            path, set(),
+            sanitizer.DenylistMatcher({"Fictional Owner Holdings"}), None, self.settings,
+        )
+        self.assertEqual(remediated, {})
+        self.assertEqual(path.read_bytes(), original_bytes)
 
 
 class RenderedOcrNoiseRegressionTest(unittest.TestCase):
