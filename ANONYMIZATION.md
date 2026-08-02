@@ -101,14 +101,17 @@ layer consults through one suppression entry point:
 Suppression applies to detector *candidates* only. It never overrides a
 denylist match, and it never removes text by itself.
 
-Outputs are written as `output/pdf/sanitized_document_01.pdf`, and so on. The
-local JSON review report contains only hashes, counts, page numbers, redaction
-categories, and masked residual shapes (letters become A/a, digits become 9).
+Each invocation publishes one immutable directory under `output/runs/<run_id>/`.
+It contains the sanitized PDF(s), `report.json`, `manifest.json`, and
+`review-summary.md`; the directory appears only after all four have been
+written. A rerun always creates a new run ID. The local JSON report contains
+only hashes, counts, page numbers, redaction categories, and masked residual
+shapes (letters become A/a, digits become 9).
 
 > Report hygiene caveat: `masked_shape` is a strict one-to-one character map,
 > so a report held *alongside its output PDF* can have distinctive long spans
-> reconstructed by matching shapes against the output text. Store the report
-> separately from the PDF if it is shared.
+> reconstructed by matching shapes against the output text. Treat the entire
+> run directory as sensitive and do not share it as an audit bundle.
 
 Edit `config/sanitizer.json` to enable normalized `[x0, y0, x1, y1]`
 rectangles for known cover, title-block, revision, seal, logo, or approval
@@ -281,7 +284,7 @@ NDA-protected project to the golden set.**
 ## Independent leak check (run this before every release)
 
 ```bash
-.venv-anonymizer/bin/python tools/verify_output_text.py output/pdf/sanitized_document_*.pdf
+.venv-anonymizer/bin/python tools/verify_output_text.py output/runs/<run_id>
 ```
 
 **A PASS in the review report is not evidence of a clean output.** The
@@ -292,15 +295,17 @@ MuPDF blocks kept the architect's name on all 43 sheets of a drawing set while
 the report showed PASS with zero residuals.
 
 `tools/verify_output_text.py` deliberately shares none of the pipeline's
-plumbing. It reads raw `page.get_text()`, flattens whitespace across the whole
-page, and looks for every denylist term with the loosest reasonable separator
-tolerance. It will surface things the pipeline is right to ignore — that is
-the point of an independent check. Any hit means open the page and look.
+extraction, rendering, OCR, or matching plumbing. It checks the run's artifact
+hashes, recomputes the live code/policy fingerprint, scans independently
+extracted text, and independently renders and OCRs every page under the same
+policy vocabulary. A changed config, denylist, lexicon, allowlist, code file,
+or output hash marks the run stale/unreleasable automatically. Any content hit
+means open the page and look.
 
 ## Residual triage
 
 When automated checks fail, the report lists each residual with its page,
-category, and masked shape, and `output/pdf/triage/<document_id>/` contains a
+category, and masked shape, and `<run_id>/triage/<document_id>/` contains a
 cropped PNG of the match region with the matched lines outlined in red. Crops
 are rendered locally and contain original page content: treat them as
 NDA-protected source material, never upload or share them, and delete the
@@ -319,11 +324,11 @@ report. A failed or incomplete visual review means the PDF must not be released.
 Release checklist:
 
 1. `release_status` is `AUTOMATED_PASS` and `residuals` is empty.
-2. `tools/verify_output_text.py` reports no known identifier in the output.
+2. `tools/verify_output_text.py output/runs/<run_id>` reports a current fingerprint and no unresolved match.
 3. `tools/eval_sanitizer.py` shows recall 100% and over-redaction 0%.
 4. The `ner_review` queue has been triaged and anything genuine has been added
    to the denylist and the document re-run.
 5. Full visual review at readable zoom, by an NDA-authorized reviewer.
-6. The reviewed file's SHA-256 matches `output_sha256` in the report.
+6. The reviewed file's SHA-256 matches the output SHA-256 in `manifest.json`.
 
 Steps 1–4 are necessary and jointly insufficient. Step 5 is the gate.

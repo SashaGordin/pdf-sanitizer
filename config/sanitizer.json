@@ -1,5 +1,6 @@
 {
   "ocr_dpi": 300,
+  "verification_ocr_dpi": 300,
   "barcode_dpi": 72,
   "barcode_max_dimension": 2400,
   "min_vector_text_chars": 20,

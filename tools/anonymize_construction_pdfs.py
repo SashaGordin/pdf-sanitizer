@@ -10,15 +10,21 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import datetime as dt
 import hashlib
+import importlib.metadata
 import io
 import json
 import os
+import platform
 import re
+import resource
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
@@ -52,7 +58,7 @@ DIRECT_PATTERNS: dict[str, re.Pattern[str]] = {
     ),
     # The trailing TLD is optional because OCR frequently splits it onto a
     # separate line; a local-part plus @ plus domain fragment is still unsafe.
-    "email": re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+"),
+    "email": re.compile(r"(?i)\b[A-Z0-9._%+-]{2,}@[A-Z0-9.-]{2,}"),
     "url": re.compile(
         r"(?i)\b(?:https?://|www\.)[^\s<>()]+|"
         r"\b[A-Z0-9.-]+\.(?:com|org|net|gov|edu|us|co|io|biz)\b"
@@ -81,7 +87,7 @@ DIRECT_PATTERNS: dict[str, re.Pattern[str]] = {
         r"\b\d{1,3}\s*[°]\s*\d{1,2}\s*['′]\s*\d{1,2}(?:\.\d+)?\s*[\"″]?\s*[NSEW]\b"
     ),
     "parcel_or_lot": re.compile(
-        r"(?i)\b(?:APN|parcel|assessor(?:'s)? parcel|lot|legal description)"
+        r"(?i)\b(?:APN|parcel|assessor(?:'s)? parcel|lot|legal description)\b"
         r"\s*(?:number|no\.?|#)?\s*[:#-]?\s*[A-Z0-9][A-Z0-9._/-]{2,}\b"
     ),
     "permit_or_application": re.compile(
@@ -346,6 +352,14 @@ def candidate_suppression(
     """
     if lexicons is None or category == "denylist":
         return None
+    # OCR commonly reads an architectural feet/inches dimension such as
+    # 6'-9" ST or 6"9 ST as the street-address span "9 ST". The quote before
+    # the numeric span is decisive construction notation, not an address.
+    if category == "street_address" and context and re.search(
+        r"\b\d{1,3}\s*['\"]\s*[-–—]?\s*\d{1,3}\s*(?:ST|RD|DR|LN|CT|CIR|PL)\b",
+        context, re.I,
+    ):
+        return "structural:feet_inches_dimension"
     # A match running across two or more cells of one row is the regex
     # stitching separate schedule cells into a phrase — "1 20 A OUTDOOR
     # CONCESSION PAD 24 21 BASKETBALL COURT" read as a street address. A
@@ -718,6 +732,7 @@ class NerSettings:
 @dataclass
 class Settings:
     ocr_dpi: int = 300
+    verification_ocr_dpi: int = 300
     barcode_dpi: int = 120
     barcode_max_dimension: int = 2400
     min_vector_text_chars: int = 20
@@ -995,9 +1010,16 @@ def following_value_lines(lines: Sequence[Line], index: int) -> Iterator[Line]:
     """Value lines that belong to a label-only line. Shared by denylist
     derivation and detection so both see the same label/value pairs."""
     label_line = lines[index]
-    for following in lines[index + 1:index + 4]:
+    label_width = max(1.0, label_line.rect.width)
+    for following in lines[index + 1:]:
         if following.rect.y0 - label_line.rect.y1 > 120:
             break
+        aligned = (
+            abs(following.rect.x0 - label_line.rect.x0) <= max(36.0, label_width * 0.5)
+            or not (following.rect & label_line.rect).is_empty
+        )
+        if not aligned:
+            continue
         candidate = normalized(following.text)
         if (
             redactable_phrase(candidate, allow_short=True)
@@ -1035,6 +1057,7 @@ def load_settings(path: Path) -> Settings:
         raise SystemExit("Sanitizer configuration could not be read") from exc
     settings = Settings(
         ocr_dpi=int(raw.get("ocr_dpi", 300)),
+        verification_ocr_dpi=int(raw.get("verification_ocr_dpi", 300)),
         barcode_dpi=int(raw.get("barcode_dpi", 120)),
         barcode_max_dimension=int(raw.get("barcode_max_dimension", 2400)),
         min_vector_text_chars=int(raw.get("min_vector_text_chars", 20)),
@@ -1048,6 +1071,7 @@ def load_settings(path: Path) -> Settings:
     )
     if (
         not 150 <= settings.ocr_dpi <= 600
+        or not 150 <= settings.verification_ocr_dpi <= 600
         or not 72 <= settings.barcode_dpi <= 300
         or not 1200 <= settings.barcode_max_dimension <= 6000
     ):
@@ -1497,7 +1521,14 @@ def run_tesseract_tsv(image: Image.Image, settings: Settings, temp_dir: Path) ->
         raise RuntimeError("local OCR failed")
     words: list[OcrWord] = []
     try:
-        reader = csv.DictReader(io.StringIO(completed.stdout.decode("utf-8", errors="replace")), delimiter="\t")
+        # Tesseract TSV is delimiter-separated but does not CSV-escape OCR text.
+        # A recognized quote glyph must remain a literal one-character field,
+        # not open a quoted field that consumes subsequent rows.
+        reader = csv.DictReader(
+            io.StringIO(completed.stdout.decode("utf-8", errors="replace")),
+            delimiter="\t",
+            quoting=csv.QUOTE_NONE,
+        )
         for row in reader:
             text = normalized(row.get("text", ""))
             if not text:
@@ -1536,10 +1567,21 @@ def following_value_ocr_lines(
     point == settings.ocr_dpi / 72, the same ratio page_image() returns)."""
     _, label_words = ordered_lines[index]
     label_bottom = max(word.top + word.height for word in label_words)
-    for following_text, following_words in ordered_lines[index + 1:index + 4]:
+    label_left = min(word.left for word in label_words)
+    label_right = max(word.left + word.width for word in label_words)
+    label_width = max(1, label_right - label_left)
+    for following_text, following_words in ordered_lines[index + 1:]:
         following_top = min(word.top for word in following_words)
         if following_top - label_bottom > 120 * scale:
             break
+        following_left = min(word.left for word in following_words)
+        following_right = max(word.left + word.width for word in following_words)
+        aligned = (
+            abs(following_left - label_left) <= max(36 * scale, label_width * 0.5)
+            or min(label_right, following_right) > max(label_left, following_left)
+        )
+        if not aligned:
+            continue
         candidate = normalized(following_text)
         if (
             redactable_phrase(candidate, allow_short=True)
@@ -1688,6 +1730,15 @@ def ocr_detection_boxes(
             )
             results.append((box, "labelled_identifier"))
     return results
+
+
+def ocr_box_to_page_rect(
+    page: fitz.Page, box: tuple[int, int, int, int], scale: float,
+) -> fitz.Rect:
+    """Map rendered-pixel OCR coordinates back to unrotated PDF space."""
+    x0, y0, x1, y1 = box
+    rendered = fitz.Rect(x0 / scale, y0 / scale, x1 / scale, y1 / scale)
+    return rendered * page.derotation_matrix if page.rotation else rendered
 
 
 def apply_image_boxes(image: Image.Image, boxes: Iterable[tuple[int, int, int, int]]) -> None:
@@ -2106,6 +2157,156 @@ def render_residual_crop(
         return None
 
 
+def process_peak_rss_bytes() -> int:
+    """Best-effort process peak RSS for verifier profiling.
+
+    macOS reports bytes and Linux reports KiB. The sanitizer is local-only,
+    so recording the host process high-water mark is more useful than a
+    Python-only allocator metric that misses MuPDF, Pillow, and Tesseract.
+    """
+    peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return peak if platform.system() == "Darwin" else peak * 1024
+
+
+def rendered_ocr_verification(
+    doc: fitz.Document,
+    denylist: DenylistMatcher,
+    lexicons: Lexicons | None,
+    settings: Settings,
+    temp_dir: Path,
+) -> dict:
+    """Render and OCR every final output page at verification_ocr_dpi.
+
+    This deliberately runs after output creation on every page, including
+    searchable and mixed pages. Matching reuses the unified raster/vector
+    policy from ticket 03; an OCR error is a failed gate, never a silent skip.
+    """
+    pages: list[dict] = []
+    totals: collections.Counter[str] = collections.Counter()
+    profile: dict[str, dict[str, float | int]] = {}
+    for page_index, page in enumerate(doc):
+        started = time.perf_counter()
+        text_length = len(normalized(page.get_text("text")))
+        raster_ratio = page_raster_ratio(page)
+        if text_length >= settings.min_vector_text_chars and raster_ratio >= settings.raster_image_area_ratio:
+            page_type = "mixed"
+        elif text_length >= settings.min_vector_text_chars:
+            page_type = "searchable"
+        else:
+            page_type = "raster"
+        suppressed: collections.Counter[str] = collections.Counter()
+        suppressed_categories: collections.Counter[str] = collections.Counter()
+        match_counts: collections.Counter[str] = collections.Counter()
+        status = "clean"
+        error: str | None = None
+        try:
+            image, scale = page_image(page, settings.verification_ocr_dpi)
+            words = run_tesseract_tsv(image, settings, temp_dir)
+            detections = ocr_detection_boxes(
+                words, denylist, lexicons, scale, suppressed, suppressed_categories,
+            )
+            match_counts.update(category for _box, category in detections)
+            if detections:
+                status = "unresolved"
+        except Exception:
+            status = "error"
+            error = "rendered-page OCR verification failed"
+        elapsed = round(time.perf_counter() - started, 6)
+        peak_rss = process_peak_rss_bytes()
+        totals[status] += 1
+        page_result = {
+            "page": page_index + 1,
+            "page_type": page_type,
+            "status": status,
+            "unresolved_match_counts": dict(sorted(match_counts.items())),
+            "suppressed_by_rule": dict(sorted(suppressed.items())),
+            "elapsed_seconds": elapsed,
+            "process_peak_rss_bytes": peak_rss,
+        }
+        if error:
+            page_result["error"] = error
+        pages.append(page_result)
+        bucket = profile.setdefault(page_type, {
+            "pages": 0, "wall_seconds": 0.0, "peak_rss_bytes": 0,
+        })
+        bucket["pages"] = int(bucket["pages"]) + 1
+        bucket["wall_seconds"] = round(float(bucket["wall_seconds"]) + elapsed, 6)
+        bucket["peak_rss_bytes"] = max(int(bucket["peak_rss_bytes"]), peak_rss)
+    return {
+        "dpi": settings.verification_ocr_dpi,
+        "pages": pages,
+        "status_counts": dict(sorted(totals.items())),
+        "profile_by_page_type": profile,
+    }
+
+
+def remediate_rendered_output(
+    destination: Path,
+    page_numbers: set[int],
+    denylist: DenylistMatcher,
+    lexicons: Lexicons | None,
+    settings: Settings,
+) -> dict[int, list[str]]:
+    """Redact final-surface OCR matches once, then let verify_output recheck.
+
+    Flattening can make outlined glyphs OCR-visible even when source OCR
+    missed them. This pass is bounded to pages the verifier marked unresolved
+    and never turns an OCR error into success.
+    """
+    if not page_numbers:
+        return {}
+    document = fitz.open(destination)
+    remediated: dict[int, list[str]] = {}
+    with tempfile.TemporaryDirectory(prefix="render_remediate_", dir=destination.parent) as temp_name:
+        temp_dir = Path(temp_name)
+        for page_number in sorted(page_numbers):
+            page = document[page_number - 1]
+            image, scale = page_image(page, settings.verification_ocr_dpi)
+            words = run_tesseract_tsv(image, settings, temp_dir)
+            detections = ocr_detection_boxes(
+                words, denylist, lexicons, scale,
+                collections.Counter(), collections.Counter(),
+            )
+            categories: set[str] = set()
+            seen: set[tuple[int, int, int, int]] = set()
+            for box, category in detections:
+                rect = ocr_box_to_page_rect(page, box, scale)
+                boundary = page.cropbox if page.rotation else page.rect
+                rect = fitz.Rect(
+                    rect.x0 - 1.5, rect.y0 - 1.5, rect.x1 + 1.5, rect.y1 + 1.5,
+                ) & boundary
+                key = tuple(round(value * 2) for value in rect)
+                if rect.is_empty or key in seen:
+                    continue
+                seen.add(key)
+                categories.add(category)
+                page.add_redact_annot(rect, fill=(0, 0, 0), cross_out=False)
+            if seen:
+                page.apply_redactions(
+                    images=fitz.PDF_REDACT_IMAGE_PIXELS,
+                    graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED,
+                    text=fitz.PDF_REDACT_TEXT_REMOVE,
+                )
+                remediated[page_number] = sorted(categories)
+        if remediated:
+            remove_interactive_content(document)
+            document.scrub(
+                attached_files=True, clean_pages=True, embedded_files=True, hidden_text=False,
+                javascript=True, metadata=True, redactions=True, remove_links=True,
+                reset_fields=True, reset_responses=True, thumbnails=True, xml_metadata=True,
+            )
+            rewritten = temp_dir / "remediated.pdf"
+            document.save(
+                rewritten, garbage=4, clean=True, deflate=True,
+                deflate_images=True, deflate_fonts=True,
+            )
+            document.close()
+            os.replace(rewritten, destination)
+        else:
+            document.close()
+    return remediated
+
+
 def verify_output(
     destination: Path,
     source_sizes: Sequence[tuple[float, float]],
@@ -2115,7 +2316,9 @@ def verify_output(
     ner_detector: NerDetector | None = None,
     lexicons: Lexicons | None = None,
     raster_page_failures: Sequence[dict] = (),
+    settings: Settings | None = None,
 ) -> dict:
+    settings = settings or Settings()
     doc = fitz.open(destination)
     residual_counts: collections.Counter[str] = collections.Counter()
     verifier_suppressed: collections.Counter[str] = collections.Counter()
@@ -2130,6 +2333,10 @@ def verify_output(
     size_mismatch_pages: list[int] = []
     blank_render_pages: list[int] = []
     interactive_pages: list[int] = []
+    with tempfile.TemporaryDirectory(prefix="render_verify_", dir=destination.parent) as verify_temp:
+        rendered_verification = rendered_ocr_verification(
+            doc, denylist, lexicons, settings, Path(verify_temp),
+        )
     if triage_dir.exists():
         shutil.rmtree(triage_dir)
     for page_index, page in enumerate(doc):
@@ -2264,6 +2471,9 @@ def verify_output(
         "attachments_empty": not doc.embfile_names(),
         "optional_content_groups_empty": not doc.get_ocgs(),
         "raster_page_verification": not raster_page_failures,
+        "rendered_page_ocr": all(
+            page["status"] == "clean" for page in rendered_verification["pages"]
+        ),
     }
     doc.close()
     result = {
@@ -2278,6 +2488,7 @@ def verify_output(
         "interactive_pages": interactive_pages,
         "rasterized_pages": sorted(raster_pages),
         "raster_page_failures": list(raster_page_failures),
+        "rendered_ocr_verification": rendered_verification,
         "release_status": automated_gate_status(checks),
     }
     if ner_detector is not None:
@@ -2350,6 +2561,63 @@ def sanitize_document(
     suppressed_categories: collections.Counter[str] = collections.Counter()
     zone: str | None = None
 
+    # Render/OCR every source page before choosing the vector or raster
+    # remediation path. This catches identifiers encoded as outlines or other
+    # visible graphics that text extraction cannot see. OCR boxes are mapped
+    # back to page coordinates and redacted alongside vector detections;
+    # pages already requiring raster reconstruction are independently handled
+    # by raster_page_pdf(). An OCR failure is fail-closed.
+    source_rendered_pages: list[dict] = []
+    source_rendered_profile: dict[str, dict[str, float | int]] = {}
+    source_rendered_detections: dict[int, list[tuple[fitz.Rect, str]]] = collections.defaultdict(list)
+    with tempfile.TemporaryDirectory(prefix="source_render_scan_", dir=temp_root) as source_scan_temp:
+        for page_index, page in enumerate(source_doc):
+            page_number = page_index + 1
+            started = time.perf_counter()
+            text_length = len(normalized(page.get_text("text")))
+            raster_ratio = page_raster_ratio(page)
+            if text_length >= settings.min_vector_text_chars and raster_ratio >= settings.raster_image_area_ratio:
+                page_type = "mixed"
+            elif text_length >= settings.min_vector_text_chars:
+                page_type = "searchable"
+            else:
+                page_type = "raster"
+            try:
+                image, scale = page_image(page, settings.verification_ocr_dpi)
+                words = run_tesseract_tsv(image, settings, Path(source_scan_temp))
+                detections = ocr_detection_boxes(
+                    words, matcher, lexicons, scale,
+                    collections.Counter(), collections.Counter(),
+                )
+            except Exception as exc:
+                source_doc.close()
+                raise PageProcessingError(
+                    page_number, "source rendered-page OCR inspection failed",
+                ) from exc
+            match_counts: collections.Counter[str] = collections.Counter(
+                category for _box, category in detections
+            )
+            source_rendered_detections[page_number].extend(
+                (ocr_box_to_page_rect(page, box, scale), category)
+                for box, category in detections
+            )
+            elapsed = round(time.perf_counter() - started, 6)
+            peak_rss = process_peak_rss_bytes()
+            source_rendered_pages.append({
+                "page": page_number,
+                "page_type": page_type,
+                "status": "remediation_required" if detections else "clean",
+                "match_counts": dict(sorted(match_counts.items())),
+                "elapsed_seconds": elapsed,
+                "process_peak_rss_bytes": peak_rss,
+            })
+            bucket = source_rendered_profile.setdefault(page_type, {
+                "pages": 0, "wall_seconds": 0.0, "peak_rss_bytes": 0,
+            })
+            bucket["pages"] = int(bucket["pages"]) + 1
+            bucket["wall_seconds"] = round(float(bucket["wall_seconds"]) + elapsed, 6)
+            bucket["peak_rss_bytes"] = max(int(bucket["peak_rss_bytes"]), peak_rss)
+
     for page_index, page in enumerate(source_doc):
         page_number = page_index + 1
         try:
@@ -2365,6 +2633,10 @@ def sanitize_document(
             )
             cells = LazyTableCells(page, lexicons is not None)
             detections = line_detections(lines, matcher, lexicons, page_number, zone, cells)
+            detections.extend(
+                Detection(rect, category, "source_rendered_ocr", page_number, zone=zone)
+                for rect, category in source_rendered_detections.get(page_number, [])
+            )
             detections.extend(
                 Detection(rect, category, "geographic", page_number, zone=zone)
                 for rect, category in geographic_rects(page, lines)
@@ -2496,7 +2768,25 @@ def sanitize_document(
         destination.parent / "triage" / document_id,
         ner_detector=ner_detector, lexicons=lexicons,
         raster_page_failures=raster_page_failures,
+        settings=settings,
     )
+    unresolved_rendered_pages = {
+        page["page"] for page in verification["rendered_ocr_verification"]["pages"]
+        if page["status"] == "unresolved"
+    }
+    rendered_output_remediation = remediate_rendered_output(
+        destination, unresolved_rendered_pages, matcher, lexicons, settings,
+    )
+    if rendered_output_remediation:
+        for page_number, categories in rendered_output_remediation.items():
+            page_categories[page_number].update(categories)
+        verification = verify_output(
+            destination, source_sizes, matcher, raster_required,
+            destination.parent / "triage" / document_id,
+            ner_detector=ner_detector, lexicons=lexicons,
+            raster_page_failures=raster_page_failures,
+            settings=settings,
+        )
     return {
         "document_id": document_id,
         "source_sha256": sha256_file(source),
@@ -2512,6 +2802,15 @@ def sanitize_document(
         "page_redactions": [
             {"page": page, "categories": sorted(categories)}
             for page, categories in sorted(page_categories.items()) if categories
+        ],
+        "source_rendered_ocr_detection": {
+            "dpi": settings.verification_ocr_dpi,
+            "pages": source_rendered_pages,
+            "profile_by_page_type": source_rendered_profile,
+        },
+        "rendered_output_remediation": [
+            {"page": page, "categories": categories}
+            for page, categories in sorted(rendered_output_remediation.items())
         ],
         **verification,
     }
@@ -2552,11 +2851,224 @@ def build_run_payload(reports: list[dict], fingerprint: dict, ner_enabled: bool)
     return payload
 
 
+def utc_timestamp() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def generate_run_id() -> str:
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    return f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def command_version(command: Sequence[str]) -> str | None:
+    try:
+        completed = subprocess.run(
+            list(command), capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    text = (completed.stdout or completed.stderr).strip()
+    return text.splitlines()[0] if completed.returncode == 0 and text else None
+
+
+def runtime_versions(settings: Settings, ner_detector: NerDetector | None) -> dict:
+    def package(name: str) -> str | None:
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            return None
+
+    model_dir = Path(settings.ner.model_dir)
+    return {
+        "python": platform.python_version(),
+        "pymupdf": getattr(fitz, "VersionBind", package("PyMuPDF")),
+        "mupdf": getattr(fitz, "VersionFitz", None),
+        "pillow": package("Pillow"),
+        "zxing_cpp": package("zxing-cpp"),
+        "reportlab": package("reportlab"),
+        "tesseract": command_version([settings.tesseract_executable, "--version"]),
+        "ghostscript": command_version([settings.ghostscript_executable, "--version"]),
+        "ner_model": {
+            "enabled": ner_detector is not None,
+            "name": ner_detector.model_name if ner_detector is not None else model_dir.name,
+            "available_locally": model_dir.is_dir(),
+        },
+    }
+
+
+def manifest_document(report: dict, run_dir: Path) -> dict:
+    document_id = report.get("document_id")
+    output_path = run_dir / f"{document_id}.pdf" if document_id else None
+    output_exists = bool(output_path and output_path.is_file())
+    return {
+        "document_id": document_id,
+        "source_sha256": report.get("source_sha256"),
+        "output": {
+            "path": output_path.name if output_exists and output_path is not None else None,
+            "sha256": report.get("output_sha256") if output_exists else None,
+        },
+        "pages": report.get("pages", 0),
+        "processing_seconds": report.get("processing_seconds"),
+        "release_status": report.get("release_status", RELEASE_STATUS_FAIL),
+        "automated_gate_results": report.get("checks", {}),
+        "statistics": {
+            "redaction_counts": report.get("redaction_counts", {}),
+            "post_flatten_redactions": report.get("post_flatten_redactions", {}),
+            "rasterized_pages": report.get("rasterized_pages", []),
+            "rendered_output_remediation": report.get("rendered_output_remediation", []),
+            "source_rendered_ocr_profile": report.get("source_rendered_ocr_detection", {}).get(
+                "profile_by_page_type", {}
+            ),
+            "rendered_ocr_profile": report.get("rendered_ocr_verification", {}).get(
+                "profile_by_page_type", {}
+            ),
+        },
+        **({"failure": report["fail_reason"]} if report.get("fail_reason") else {}),
+    }
+
+
+def build_manifest(
+    *, run_id: str, started_at: str, completed_at: str, payload: dict,
+    fingerprint: dict, versions: dict, run_dir: Path,
+) -> dict:
+    documents = [manifest_document(report, run_dir) for report in payload["documents"]]
+    return {
+        "schema_version": 1,
+        "run_id": run_id,
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "release_status": payload["release_status"],
+        "fingerprint": fingerprint,
+        "code_identity": fingerprint["code"],
+        "runtime_versions": versions,
+        "documents": documents,
+        "statistics": {
+            "documents": len(documents),
+            "pages": sum(int(item.get("pages") or 0) for item in documents),
+            "rasterized_pages": sum(
+                len(item["statistics"]["rasterized_pages"]) for item in documents
+            ),
+        },
+        "automated_gate_results": {
+            "all_automated_checks_pass": payload["all_automated_checks_pass"],
+            "documents": {
+                item["document_id"]: item["automated_gate_results"] for item in documents
+                if item["document_id"]
+            },
+        },
+        "review": {
+            "status": "not_started",
+            "reviewer": None,
+            "completed_at": None,
+        },
+    }
+
+
+def review_summary(run_id: str, payload: dict, manifest: dict) -> str:
+    lines = [
+        f"# Sanitization review — {run_id}", "",
+        f"Release status: **{payload['release_status']}**", "",
+        "This run is not safe to release until an NDA-authorized reviewer completes local visual review and records it in `manifest.json`.",
+        "", "## Documents", "",
+    ]
+    for document in manifest["documents"]:
+        lines.append(
+            f"- `{document['document_id']}`: {document['release_status']}; "
+            f"{document['pages']} page(s); output `{document['output']['path'] or 'none'}`"
+        )
+    lines.extend(["", "## Review record", "", "- Status: not_started", "- Reviewer: —", "- Completed: —", ""])
+    return "\n".join(lines)
+
+
+def write_private_text(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+    os.chmod(path, 0o600)
+
+
+def orchestrate_run(
+    *, sources: Sequence[Path], output_root: Path, output_index_start: int,
+    denylist: set[str], settings: Settings, temp_root: Path,
+    denylist_path: Path | None, project_metadata_path: Path | None,
+    config_path: Path, allowlist_path: Path | None, lexicon_dir: Path,
+    lexicons: Lexicons | None, ner_detector: NerDetector | None,
+    script_path: Path = Path(__file__), repo_root: Path | None = None,
+) -> tuple[Path, dict]:
+    """Build a complete run in a private temp directory, then publish once.
+
+    The final run directory is created only by the atomic rename. Processing
+    failures are converted into a FAIL document record before publication.
+    """
+    output_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(output_root, 0o700)
+    run_id = generate_run_id()
+    final_dir = output_root / run_id
+    while final_dir.exists():
+        run_id = generate_run_id()
+        final_dir = output_root / run_id
+    staging_dir = Path(tempfile.mkdtemp(prefix=f".{run_id}.tmp-", dir=output_root))
+    os.chmod(staging_dir, 0o700)
+    started_at = utc_timestamp()
+    fingerprint = build_fingerprint(
+        script_path=script_path,
+        repo_root=repo_root or script_path.resolve().parent.parent,
+        denylist_path=denylist_path,
+        project_metadata_path=project_metadata_path,
+        config_path=config_path,
+        allowlist_path=allowlist_path,
+        lexicon_dir=lexicon_dir,
+    )
+    reports: list[dict] = []
+    active_id: str | None = None
+    active_source: Path | None = None
+    try:
+        for index, source in enumerate(sources, output_index_start):
+            active_id = f"sanitized_document_{index:02d}"
+            active_source = source
+            destination = staging_dir / f"{active_id}.pdf"
+            print(f"{active_id}: processing input {len(reports) + 1}/{len(sources)}", file=sys.stderr)
+            started = time.perf_counter()
+            report = sanitize_document(
+                source, destination, active_id, denylist, settings, temp_root,
+                ner_detector=ner_detector, lexicons=lexicons,
+            )
+            report["processing_seconds"] = round(time.perf_counter() - started, 6)
+            reports.append(report)
+    except (Exception, SystemExit) as exc:
+        if isinstance(exc, PageProcessingError):
+            reason = f"processing stopped at page {exc.page_number}: {exc.reason}"
+        elif isinstance(exc, SystemExit) and str(exc):
+            reason = str(exc)
+        else:
+            reason = "processing failed before the run completed"
+        reports.append({
+            "document_id": active_id or f"sanitized_document_{output_index_start:02d}",
+            "source_sha256": sha256_file(active_source) if active_source and active_source.is_file() else None,
+            "pages": 0,
+            "checks": {"processing_completed": False},
+            "release_status": RELEASE_STATUS_FAIL,
+            "fail_reason": reason,
+        })
+    payload = build_run_payload(reports, fingerprint, ner_detector is not None)
+    completed_at = utc_timestamp()
+    versions = runtime_versions(settings, ner_detector)
+    manifest = build_manifest(
+        run_id=run_id, started_at=started_at, completed_at=completed_at,
+        payload=payload, fingerprint=fingerprint, versions=versions, run_dir=staging_dir,
+    )
+    write_private_text(staging_dir / "report.json", json.dumps(payload, indent=2) + "\n")
+    write_private_text(staging_dir / "manifest.json", json.dumps(manifest, indent=2) + "\n")
+    write_private_text(staging_dir / "review-summary.md", review_summary(run_id, payload, manifest))
+    os.replace(staging_dir, final_dir)
+    return final_dir, payload
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sanitize construction PDFs entirely on the local machine")
     parser.add_argument("inputs", nargs="+", help="PDF files or directories")
-    parser.add_argument("--output-dir", type=Path, default=Path("output/pdf"))
-    parser.add_argument("--report", type=Path, default=Path("output/pdf/sanitization_review_report.json"))
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("output/runs"),
+        help="root directory under which a unique immutable run directory is published",
+    )
     parser.add_argument("--config", type=Path, default=Path("config/sanitizer.json"))
     parser.add_argument("--denylist", type=Path, default=Path("config/denylist.local.json"))
     parser.add_argument(
@@ -2620,33 +3132,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("NER review layer enabled (report-only; never changes automated checks)", file=sys.stderr)
     temp_root = Path("tmp/pdfs")
     temp_root.mkdir(parents=True, exist_ok=True)
-    reports: list[dict] = []
-    try:
-        for index, source in enumerate(sources, args.output_index_start):
-            document_id = f"sanitized_document_{index:02d}"
-            destination = args.output_dir / f"{document_id}.pdf"
-            print(f"{document_id}: processing input {len(reports) + 1}/{len(sources)}", file=sys.stderr)
-            reports.append(sanitize_document(
-                source, destination, document_id, denylist, settings, temp_root,
-                ner_detector=ner_detector, lexicons=lexicons,
-            ))
-    except PageProcessingError as exc:
-        print(f"Processing stopped at page {exc.page_number}: {exc.reason}; no page content displayed", file=sys.stderr)
-        return 3
-    fingerprint = build_fingerprint(
-        script_path=Path(__file__),
-        repo_root=Path(__file__).resolve().parent.parent,
+    run_dir, payload = orchestrate_run(
+        sources=sources,
+        output_root=args.output_dir,
+        output_index_start=args.output_index_start,
+        denylist=denylist,
+        settings=settings,
+        temp_root=temp_root,
         denylist_path=args.denylist if denylist_file_present else None,
         project_metadata_path=args.project_metadata,
         config_path=args.config,
         allowlist_path=args.allowlist,
         lexicon_dir=args.lexicons,
+        lexicons=lexicons,
+        ner_detector=ner_detector,
     )
-    payload = build_run_payload(reports, fingerprint, ner_detector is not None)
-    args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({
-        "documents": len(reports),
+        "run_directory": str(run_dir),
+        "documents": len(payload["documents"]),
         "all_automated_checks_pass": payload["all_automated_checks_pass"],
         "release_status": payload["release_status"],
     }), file=sys.stderr)

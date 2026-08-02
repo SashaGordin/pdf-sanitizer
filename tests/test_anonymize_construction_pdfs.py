@@ -30,6 +30,13 @@ assert SPEC and SPEC.loader
 sys.modules[SPEC.name] = sanitizer
 SPEC.loader.exec_module(sanitizer)
 
+VERIFY_MODULE_PATH = Path(__file__).parents[1] / "tools" / "verify_output_text.py"
+VERIFY_SPEC = importlib.util.spec_from_file_location("verify_existing", VERIFY_MODULE_PATH)
+verify_existing = importlib.util.module_from_spec(VERIFY_SPEC)
+assert VERIFY_SPEC and VERIFY_SPEC.loader
+sys.modules[VERIFY_SPEC.name] = verify_existing
+VERIFY_SPEC.loader.exec_module(verify_existing)
+
 
 FAKE_TERMS = {
     "Fictional Owner Holdings",
@@ -374,9 +381,12 @@ class SanitizerTests(unittest.TestCase):
     def test_ghostscript_timeout_fails_closed_without_hanging(self) -> None:
         source = self.root / "source.pdf"
         create_searchable_pdf(source)
+        real_run = subprocess.run
 
         def timing_out(cmd, *args, **kwargs):
-            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+            if Path(cmd[0]).name in {"gs", "ghostscript"}:
+                raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+            return real_run(cmd, *args, **kwargs)
 
         with mock.patch.object(subprocess, "run", side_effect=timing_out):
             with self.assertRaises(sanitizer.PageProcessingError) as caught:
@@ -1327,11 +1337,12 @@ class FingerprintCliWiringTest(unittest.TestCase):
         for name in sanitizer.LEXICON_FILENAMES:
             (self.lexicon_dir / name).write_text("{}")
 
-    def run_main(self, report_path: Path) -> dict:
+    def run_main(self) -> tuple[Path, dict]:
+        output_root = self.root / "output"
+        before = set(output_root.iterdir()) if output_root.exists() else set()
         argv = [
             str(self.source),
-            "--output-dir", str(self.root / "output"),
-            "--report", str(report_path),
+            "--output-dir", str(output_root),
             "--config", str(self.config_path),
             "--denylist", str(self.denylist_path),
             "--lexicons", str(self.lexicon_dir),
@@ -1339,11 +1350,15 @@ class FingerprintCliWiringTest(unittest.TestCase):
         ]
         exit_code = sanitizer.main(argv)
         self.assertEqual(exit_code, 0)
-        return json.loads(report_path.read_text())
+        created = set(output_root.iterdir()) - before
+        self.assertEqual(len(created), 1)
+        run_dir = created.pop()
+        return run_dir, json.loads((run_dir / "report.json").read_text())
 
     def test_two_runs_yield_identical_fingerprint(self) -> None:
-        first = self.run_main(self.root / "report1.json")
-        second = self.run_main(self.root / "report2.json")
+        first_dir, first = self.run_main()
+        second_dir, second = self.run_main()
+        self.assertNotEqual(first_dir, second_dir)
         self.assertEqual(first["fingerprint"], second["fingerprint"])
         self.assertEqual(
             first["fingerprint"]["denylist_sha256"],
@@ -1594,5 +1609,360 @@ class ArchitectOfRecordTest(unittest.TestCase):
         raw = destination.read_bytes().lower()
         self.assertNotIn(b"fakename architecture group", raw)
         self.assertNotIn(b"someplace", raw)
+class AtomicRunPackagingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="atomic_run_test_")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.source = self.root / "source.pdf"
+        self.source.write_bytes(b"synthetic source")
+        self.config = self.root / "config.json"
+        self.config.write_text("{}")
+        self.denylist = self.root / "denylist.json"
+        self.denylist.write_text(json.dumps({"identifiers": ["Fictional Owner Holdings"]}))
+        self.allowlist = self.root / "allowlist.json"
+        self.allowlist.write_text("{}")
+        self.lexicons = self.root / "lexicons"
+        self.lexicons.mkdir()
+        for name in sanitizer.LEXICON_FILENAMES:
+            (self.lexicons / name).write_text("{}")
+        self.output_root = self.root / "runs"
+        self.temp_root = self.root / "tmp"
+        self.temp_root.mkdir()
+
+    @staticmethod
+    def fake_sanitize(source, destination, document_id, denylist, settings, temp_root,
+                      ner_detector=None, lexicons=None):
+        destination.write_bytes(b"synthetic sanitized pdf")
+        return {
+            "document_id": document_id,
+            "source_sha256": sanitizer.sha256_file(source),
+            "output_sha256": sanitizer.sha256_file(destination),
+            "pages": 2,
+            "redaction_counts": {"denylist": 1},
+            "post_flatten_redactions": {},
+            "rasterized_pages": [2],
+            "checks": {"rendered_page_ocr": True},
+            "rendered_ocr_verification": {
+                "profile_by_page_type": {
+                    "searchable": {"pages": 1, "wall_seconds": 0.1, "peak_rss_bytes": 123},
+                },
+            },
+            "release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS,
+        }
+
+    def run_once(self) -> tuple[Path, dict]:
+        with (
+            mock.patch.object(sanitizer, "sanitize_document", side_effect=self.fake_sanitize),
+            mock.patch.object(sanitizer, "runtime_versions", return_value={"python": "test"}),
+        ):
+            return sanitizer.orchestrate_run(
+                sources=[self.source], output_root=self.output_root, output_index_start=1,
+                denylist={"Fictional Owner Holdings"}, settings=sanitizer.Settings(),
+                temp_root=self.temp_root, denylist_path=self.denylist,
+                project_metadata_path=None, config_path=self.config,
+                allowlist_path=self.allowlist, lexicon_dir=self.lexicons,
+                lexicons=None, ner_detector=None,
+            )
+
+    def test_two_runs_are_distinct_complete_atomic_packages(self) -> None:
+        real_replace = os.replace
+        observed: list[tuple[Path, Path]] = []
+
+        def asserting_replace(source, destination):
+            source_path, destination_path = Path(source), Path(destination)
+            self.assertFalse(destination_path.exists())
+            for required in ("sanitized_document_01.pdf", "report.json", "manifest.json", "review-summary.md"):
+                self.assertTrue((source_path / required).is_file())
+            observed.append((source_path, destination_path))
+            real_replace(source, destination)
+
+        with mock.patch.object(sanitizer.os, "replace", side_effect=asserting_replace):
+            first, first_payload = self.run_once()
+            second, second_payload = self.run_once()
+        self.assertNotEqual(first, second)
+        self.assertEqual(len(observed), 2)
+        self.assertEqual(first_payload["release_status"], sanitizer.RELEASE_STATUS_REVIEW_REQUIRED)
+        self.assertEqual(second_payload["release_status"], sanitizer.RELEASE_STATUS_REVIEW_REQUIRED)
+        self.assertFalse(any(path.name.startswith(".") for path in self.output_root.iterdir()))
+        manifest = json.loads((first / "manifest.json").read_text())
+        self.assertEqual(manifest["run_id"], first.name)
+        self.assertIn("runtime_versions", manifest)
+        self.assertEqual(manifest["review"], {
+            "status": "not_started", "reviewer": None, "completed_at": None,
+        })
+
+    def test_failure_still_publishes_a_failure_record(self) -> None:
+        with (
+            mock.patch.object(sanitizer, "sanitize_document", side_effect=RuntimeError("boom")),
+            mock.patch.object(sanitizer, "runtime_versions", return_value={"python": "test"}),
+        ):
+            run_dir, payload = sanitizer.orchestrate_run(
+                sources=[self.source], output_root=self.output_root, output_index_start=1,
+                denylist={"Fictional Owner Holdings"}, settings=sanitizer.Settings(),
+                temp_root=self.temp_root, denylist_path=self.denylist,
+                project_metadata_path=None, config_path=self.config,
+                allowlist_path=self.allowlist, lexicon_dir=self.lexicons,
+                lexicons=None, ner_detector=None,
+            )
+        self.assertTrue((run_dir / "manifest.json").is_file())
+        self.assertEqual(payload["release_status"], sanitizer.RELEASE_STATUS_FAIL)
+        self.assertEqual(payload["documents"][0]["release_status"], sanitizer.RELEASE_STATUS_FAIL)
+        self.assertFalse(payload["documents"][0]["checks"]["processing_completed"])
+
+
+class RenderedPageOcrVerifierTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="render_verify_test_")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.settings = sanitizer.Settings(
+            detect_barcodes=False, redact_repeated_margin_images=False,
+            progress_every_pages=0,
+        )
+
+    def make_pdf(self, pages: int = 1) -> Path:
+        path = self.root / "output.pdf"
+        pdf = canvas.Canvas(str(path), pagesize=letter)
+        for _ in range(pages):
+            pdf.drawString(45, 700, "TECHNICAL: ASTM A36 structural steel")
+            pdf.showPage()
+        pdf.save()
+        doc = fitz.open(path)
+        doc.set_metadata({})
+        cleaned = path.with_suffix(".cleaned.pdf")
+        doc.save(cleaned)
+        doc.close()
+        cleaned.replace(path)
+        return path
+
+    @staticmethod
+    def words(*values: str) -> list[sanitizer.OcrWord]:
+        return [
+            sanitizer.OcrWord(value, 10 + index * 90, 10, 80, 15, 1, 1, 1)
+            for index, value in enumerate(values)
+        ]
+
+    def verify(self, path: Path, mocked_words) -> dict:
+        with mock.patch.object(sanitizer, "run_tesseract_tsv", side_effect=mocked_words):
+            return sanitizer.verify_output(
+                path, [(612.0, 792.0)] * len(fitz.open(path)),
+                sanitizer.DenylistMatcher({"Fictional Owner Holdings"}), set(),
+                self.root / "triage", settings=self.settings,
+                lexicons=sanitizer.load_lexicons(REPO_LEXICONS, REPO_ALLOWLIST),
+            )
+
+    def test_pixel_only_identifier_blocks_automated_pass(self) -> None:
+        path = self.make_pdf()
+        report = self.verify(path, [self.words("Fictional", "Owner", "Holdings")])
+        self.assertTrue(report["checks"]["denylist_scan"])
+        self.assertFalse(report["checks"]["rendered_page_ocr"])
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_FAIL)
+        page = report["rendered_ocr_verification"]["pages"][0]
+        self.assertEqual(page["status"], "unresolved")
+        self.assertEqual(page["unresolved_match_counts"], {"denylist": 1})
+
+    def test_suppressed_rendered_match_stays_clean(self) -> None:
+        path = self.make_pdf()
+        report = self.verify(path, [self.words("3", "CIR")])
+        self.assertTrue(report["checks"]["rendered_page_ocr"])
+        self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
+        page = report["rendered_ocr_verification"]["pages"][0]
+        self.assertEqual(page["status"], "clean")
+        self.assertEqual(page["suppressed_by_rule"], {"structural": 1})
+
+    def test_every_page_has_a_rendered_verification_record(self) -> None:
+        path = self.make_pdf(pages=2)
+        report = self.verify(path, [[], []])
+        pages = report["rendered_ocr_verification"]["pages"]
+        self.assertEqual([page["page"] for page in pages], [1, 2])
+        self.assertTrue(all("elapsed_seconds" in page and "process_peak_rss_bytes" in page for page in pages))
+
+
+class RenderedOcrNoiseRegressionTest(unittest.TestCase):
+    TSV_WITH_LITERAL_QUOTE = (
+        "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
+        "5\t1\t1\t1\t1\t1\t10\t10\t5\t10\t90\t\"\n"
+        "5\t1\t2\t1\t1\t1\t20\t30\t30\t10\t90\tNEXT\n"
+    ).encode()
+
+    def test_label_lookahead_is_aligned_and_not_limited_by_global_line_order(self) -> None:
+        words = [
+            sanitizer.OcrWord("JOB", 100, 10, 40, 15, 1, 1, 1),
+            sanitizer.OcrWord("NUMBER", 145, 10, 70, 15, 1, 1, 1),
+            sanitizer.OcrWord("SPECIFICATIONS", 500, 20, 160, 15, 2, 1, 1),
+            sanitizer.OcrWord("EXH", 700, 30, 40, 15, 3, 1, 1),
+            sanitizer.OcrWord("UNRELATED", 900, 35, 100, 15, 4, 1, 1),
+            sanitizer.OcrWord("21109", 105, 45, 70, 15, 5, 1, 1),
+        ]
+        detections = sanitizer.ocr_detection_boxes(
+            words, sanitizer.DenylistMatcher({"Never Matches"}), scale=1.0,
+        )
+        self.assertEqual([category for _box, category in detections], ["labelled_identifier"])
+        self.assertLess(detections[0][0][0], 200)
+
+    def test_short_ocr_at_fragments_are_not_emails(self) -> None:
+        pattern = sanitizer.DIRECT_PATTERNS["email"]
+        self.assertIsNone(pattern.search("a@c c@k KE@c"))
+        self.assertIsNotNone(pattern.search("contact@example"))
+
+    def test_dimension_and_lothil_noise_are_not_identifiers(self) -> None:
+        self.assertIsNone(sanitizer.DIRECT_PATTERNS["parcel_or_lot"].search("Lothil"))
+        lexicons = sanitizer.load_lexicons(REPO_LEXICONS, REPO_ALLOWLIST)
+        reason = sanitizer.candidate_suppression(
+            "street_address", "9 ST", lexicons, context='6"9 ST',
+        )
+        self.assertEqual(reason, "structural:feet_inches_dimension")
+
+    def test_pipeline_tsv_parser_treats_ocr_quote_as_literal_text(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, stdout=self.TSV_WITH_LITERAL_QUOTE)
+        with (
+            tempfile.TemporaryDirectory() as temp_name,
+            mock.patch.object(sanitizer.shutil, "which", return_value="/usr/bin/tesseract"),
+            mock.patch.object(sanitizer.subprocess, "run", return_value=completed),
+        ):
+            words = sanitizer.run_tesseract_tsv(
+                Image.new("RGB", (50, 50)), sanitizer.Settings(), Path(temp_name),
+            )
+        self.assertEqual([word.text for word in words], ['"', "NEXT"])
+
+    def test_independent_tsv_parser_treats_ocr_quote_as_literal_text(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, stdout=self.TSV_WITH_LITERAL_QUOTE)
+        with tempfile.TemporaryDirectory() as temp_name:
+            pdf_path = Path(temp_name) / "blank.pdf"
+            pdf = canvas.Canvas(str(pdf_path), pagesize=letter)
+            pdf.showPage()
+            pdf.save()
+            document = fitz.open(pdf_path)
+            with (
+                mock.patch.object(verify_existing.shutil, "which", return_value="/usr/bin/tesseract"),
+                mock.patch.object(verify_existing.subprocess, "run", return_value=completed),
+            ):
+                lines = verify_existing.independent_rendered_lines(
+                    document[0], "tesseract", 300, Path(temp_name),
+                )
+            document.close()
+        self.assertEqual([line.text for line in lines], ['"', "NEXT"])
+
+
+class VerifyExistingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="verify_existing_test_")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.tools = self.root / "tools"
+        self.tools.mkdir()
+        self.script = self.tools / "anonymize_construction_pdfs.py"
+        self.script.write_text("# synthetic sanitizer\n")
+        self.config = self.root / "config.json"
+        self.config.write_text("{}")
+        self.denylist = self.root / "denylist.json"
+        self.denylist.write_text(json.dumps({"identifiers": ["Fictional Owner Holdings"]}))
+        self.allowlist = self.root / "allowlist.json"
+        self.allowlist.write_text(json.dumps({"entries": []}))
+        self.lexicons = self.root / "lexicons"
+        self.lexicons.mkdir()
+        (self.lexicons / "contract_defined_terms.json").write_text(json.dumps({"terms": []}))
+        (self.lexicons / "structural_patterns.json").write_text(json.dumps({"suppress_if_span_matches": []}))
+        (self.lexicons / "boilerplate.json").write_text(json.dumps({"phrases": []}))
+        self.run_dir = self.root / "run"
+        self.run_dir.mkdir()
+        self.pdf = self.run_dir / "sanitized_document_01.pdf"
+        pdf = canvas.Canvas(str(self.pdf), pagesize=letter)
+        pdf.drawString(45, 700, "TECHNICAL: ASTM A36 structural steel")
+        pdf.save()
+        fingerprint = verify_existing.current_fingerprint(
+            sanitizer_script=self.script, repo_root=self.root,
+            denylist=self.denylist, project_metadata=None, config=self.config,
+            allowlist=self.allowlist, lexicons=self.lexicons,
+        )
+        manifest = {
+            "run_id": "test-run", "fingerprint": fingerprint,
+            "documents": [{
+                "document_id": "sanitized_document_01",
+                "output": {"path": self.pdf.name, "sha256": verify_existing.sha256_file(self.pdf)},
+            }],
+        }
+        (self.run_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    def verify(self) -> dict:
+        with mock.patch.object(
+            verify_existing, "independent_rendered_lines",
+            return_value=[verify_existing.IndependentLine(
+                "TECHNICAL: ASTM A36 structural steel", 0, 0, 500, 20,
+            )],
+        ):
+            return verify_existing.verify_run(
+                self.run_dir, denylist=self.denylist, project_metadata=None,
+                config=self.config, lexicons=self.lexicons, allowlist=self.allowlist,
+                sanitizer_script=self.script,
+            )
+
+    def test_matching_fingerprint_is_current(self) -> None:
+        result = self.verify()
+        self.assertEqual(result["fingerprint_status"], "current")
+        self.assertEqual(result["release_status"], "AUTOMATED_PASS")
+        self.assertEqual(result["documents"][0]["artifact_status"], "current")
+
+    def test_mutated_config_is_stale_without_manual_hash_comparison(self) -> None:
+        self.config.write_text(json.dumps({"verification_ocr_dpi": 301}))
+        result = self.verify()
+        self.assertEqual(result["fingerprint_status"], "stale")
+        self.assertEqual(result["release_status"], "FAIL")
+
+    def test_verifier_does_not_import_pipeline_plumbing(self) -> None:
+        source = VERIFY_MODULE_PATH.read_text()
+        self.assertNotRegex(
+            source, r"(?m)^\s*(?:from|import)\s+anonymize_construction_pdfs\b",
+        )
+        self.assertIn("Independence is a safety property", source)
+
+    def test_legacy_directory_without_manifest_is_unreleasable(self) -> None:
+        legacy = self.root / "legacy-output"
+        legacy.mkdir()
+        (legacy / "sanitized_document_01.pdf").write_bytes(self.pdf.read_bytes())
+        with self.assertRaisesRegex(ValueError, "no manifest"):
+            verify_existing.verify_run(
+                legacy, denylist=self.denylist, project_metadata=None,
+                config=self.config, lexicons=self.lexicons,
+                allowlist=self.allowlist, sanitizer_script=self.script,
+            )
+
+    def test_independent_label_geometry_ignores_table_codes(self) -> None:
+        policy = verify_existing.IndependentPolicy.load(
+            self.denylist, None, self.lexicons, self.allowlist,
+        )
+        lines = [
+            verify_existing.IndependentLine("ENGINEERING", 100, 10, 190, 22),
+            verify_existing.IndependentLine("190", 105, 30, 130, 42),
+            verify_existing.IndependentLine('12"x6"', 105, 48, 150, 60),
+            verify_existing.IndependentLine("SG5", 105, 66, 135, 78),
+            verify_existing.IndependentLine("JOB NUMBER", 300, 10, 400, 22),
+            verify_existing.IndependentLine("UNRELATED", 700, 30, 800, 42),
+            verify_existing.IndependentLine("21109", 305, 66, 350, 78),
+        ]
+        self.assertEqual(policy.scan_lines(lines), {"labelled_identifier": 1})
+
+    def test_independent_policy_suppresses_decimal_section_as_address(self) -> None:
+        policy = verify_existing.IndependentPolicy.load(
+            self.denylist, None, self.lexicons, self.allowlist,
+        )
+        line = verify_existing.IndependentLine(
+            "1.5 OPERATION AND MAINTENANCE shall be tested in place before covering.",
+            0, 0, 500, 20,
+        )
+        self.assertEqual(policy.scan_lines([line]), {})
+
+    def test_independent_label_does_not_reach_into_distant_table_heading(self) -> None:
+        policy = verify_existing.IndependentPolicy.load(
+            self.denylist, None, self.lexicons, self.allowlist,
+        )
+        lines = [
+            verify_existing.IndependentLine("PROJECT", 100, 10, 170, 22),
+            verify_existing.IndependentLine("QUANTITY VOLTAGE", 105, 100, 250, 112),
+        ]
+        self.assertEqual(policy.scan_lines(lines), {})
+
+
 if __name__ == "__main__":
     unittest.main()

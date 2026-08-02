@@ -20,25 +20,32 @@ one-time cleanup, not an ongoing retention policy.
 **Blocked by:** 01 (manifest carries the release-status vocabulary), 02
 (manifest carries the fingerprint hashes).
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Two consecutive runs against the same inputs produce two distinct
+- [x] Two consecutive runs against the same inputs produce two distinct
       run-ID directories; neither overwrites the other.
-- [ ] A forced failure partway through a run (mocked exception) still
+- [x] A forced failure partway through a run (mocked exception) still
       produces a failure record in its own run directory rather than no
       report at all.
-- [ ] The manifest contains run ID, timestamps, source/output SHA-256 hashes,
+- [x] The manifest contains run ID, timestamps, source/output SHA-256 hashes,
       source commit identity or build digest, the ticket-02 fingerprint
       hashes, OCR/PDF/barcode/NER-model/Ghostscript/dependency versions, page
       counts and processing statistics, automated-gate results, and review
       status/reviewer/completion fields (populated once a human records
       review — no reviewer UI in scope).
-- [ ] Publishing is atomic: the run directory only ever appears fully-formed
+- [x] Publishing is atomic: the run directory only ever appears fully-formed
       (temp-write then rename), never partially written at its final path.
-- [ ] The pre-existing stale artifacts named above are deleted from the
+- [x] The pre-existing stale artifacts named above are deleted from the
       current shared output directory as part of this ticket landing —
       confirm with the user immediately before deleting, since this is
       destructive.
-- [ ] Existing tooling that assumed fixed paths under `output/pdf/` (e.g. any
+- [x] Existing tooling that assumed fixed paths under `output/pdf/` (e.g. any
       ad hoc invocations of `tools/verify_output_text.py`) is updated to
       operate against a run directory instead.
+
+## Comments
+
+Implementation and automated coverage completed 2026-08-01. A fresh 43-page
+run published atomically at `output/runs/20260801T231421.035584Z-a6b4b0d9`.
+The user confirmed the one-time legacy cleanup immediately before deletion;
+the seven fixed-path output artifacts and backup denylist were removed.
