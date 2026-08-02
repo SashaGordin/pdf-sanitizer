@@ -1268,16 +1268,22 @@ class CodeIdentityTest(unittest.TestCase):
         self.assertIn(identity["commit_dirty"], (True, False))
 
     def test_nested_directory_without_its_own_git_does_not_inherit_ancestor_head(self) -> None:
+        # Build this fixture's own throwaway repo with a hermetic
+        # environment: if this test happens to run under a git hook (e.g.
+        # this project's own pre-push hook invoked from a linked worktree),
+        # ambient GIT_DIR/GIT_WORK_TREE would otherwise redirect these git
+        # commands at *that* repository instead of the fresh one below.
+        env = sanitizer._hermetic_git_env()
         outer = self.root / "outer"
         outer.mkdir()
-        subprocess.run(["git", "init", "--quiet"], cwd=outer, check=True, capture_output=True)
+        subprocess.run(["git", "init", "--quiet"], cwd=outer, env=env, check=True, capture_output=True)
         subprocess.run(
-            ["git", "config", "user.email", "test@example.invalid"], cwd=outer, check=True, capture_output=True,
+            ["git", "config", "user.email", "test@example.invalid"], cwd=outer, env=env, check=True, capture_output=True,
         )
-        subprocess.run(["git", "config", "user.name", "Test"], cwd=outer, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=outer, env=env, check=True, capture_output=True)
         (outer / "file.txt").write_text("content\n")
-        subprocess.run(["git", "add", "file.txt"], cwd=outer, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=outer, check=True, capture_output=True)
+        subprocess.run(["git", "add", "file.txt"], cwd=outer, env=env, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=outer, env=env, check=True, capture_output=True)
         inner = outer / "inner"
         inner.mkdir()
         script = inner / "script.py"

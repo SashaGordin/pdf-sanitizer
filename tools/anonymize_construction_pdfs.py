@@ -819,6 +819,27 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+# Environment variables git uses to pin discovery to a specific repository,
+# overriding the normal cwd-based upward search. A caller running under a
+# git hook (e.g. this project's own pre-push hook, invoked from a linked
+# worktree) inherits these pointing at *that* repository; left in place,
+# they'd redirect code_identity()'s git calls away from repo_root to
+# whichever repo the ambient hook was invoked for.
+_GIT_DISCOVERY_OVERRIDE_VARS = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
+)
+
+
+def _hermetic_git_env() -> dict[str, str]:
+    """A copy of the current environment safe to hand to a git subprocess
+    that must discover its repository strictly from the given cwd."""
+    return {
+        key: value for key, value in os.environ.items()
+        if key not in _GIT_DISCOVERY_OVERRIDE_VARS
+    }
+
+
 def code_identity(script_path: Path, repo_root: Path, *, timeout: float = 5.0) -> dict:
     """Identify the exact code that ran. build_digest_sha256 is the ground
     truth (always present, catches uncommitted edits); commit/commit_dirty are
@@ -829,13 +850,14 @@ def code_identity(script_path: Path, repo_root: Path, *, timeout: float = 5.0) -
     build_digest = sha256_file(script_path)
     commit: str | None = None
     dirty: bool | None = None
+    env = _hermetic_git_env()
     try:
         head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=repo_root,
+            ["git", "rev-parse", "HEAD"], cwd=repo_root, env=env,
             capture_output=True, text=True, timeout=timeout,
         )
         toplevel = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"], cwd=repo_root,
+            ["git", "rev-parse", "--show-toplevel"], cwd=repo_root, env=env,
             capture_output=True, text=True, timeout=timeout,
         )
         if (
@@ -845,7 +867,7 @@ def code_identity(script_path: Path, repo_root: Path, *, timeout: float = 5.0) -
             commit = head.stdout.strip()
             diff = subprocess.run(
                 ["git", "diff", "--quiet", "HEAD", "--", str(script_path)],
-                cwd=repo_root, timeout=timeout,
+                cwd=repo_root, env=env, timeout=timeout,
             )
             # Anything other than a clean 0/1 (git error, ambiguous pathspec)
             # is unknown, not "dirty".
