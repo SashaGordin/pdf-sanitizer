@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PROTOTYPE -- reviewer triage web (issue #7)</title>
+<style>
+  :root {
+    --sensitive: #b4232a;
+    --safe: #1f7a3f;
+    --duplicate: #8a5a00;
+    --escalate: #6b3fa0;
+    --ink: #1c1c1c;
+    --paper: #faf8f3;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    margin: 0; padding: 0 0 90px 0;
+    background: #eee; color: var(--ink);
+  }
+  .banner {
+    background: #222; color: #ffd54a; text-align: center;
+    font-size: 12px; padding: 4px; letter-spacing: 0.03em;
+  }
+  #app { max-width: 1100px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 18px; margin: 0 0 4px 0; }
+  .sub { color: #666; font-size: 13px; margin-bottom: 18px; }
+  .reviewer-row { margin-bottom: 16px; font-size: 13px; }
+  .reviewer-row input {
+    padding: 4px 8px; font-size: 13px; border: 1px solid #ccc; border-radius: 4px;
+  }
+
+  /* crop placeholder: fake "document page" with a highlighted masked shape */
+  .crop {
+    background: var(--paper);
+    border: 1px solid #d8d2c2;
+    border-radius: 4px;
+    padding: 10px;
+    width: 100%;
+    min-height: 90px;
+  }
+  .crop .line { height: 7px; background: #ddd7c8; border-radius: 2px; margin: 6px 0; }
+  .crop .line.short { width: 55%; }
+  .crop .highlight {
+    display: inline-block;
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    padding: 3px 6px;
+    border-radius: 3px;
+    border: 1.5px dashed;
+    margin: 4px 0;
+  }
+  .crop-missing { color: #999; font-size: 11px; margin-top: 6px; }
+
+  .badge {
+    display: inline-block; font-size: 10px; text-transform: uppercase;
+    letter-spacing: 0.04em; padding: 2px 6px; border-radius: 3px; color: #fff;
+    margin-right: 6px;
+  }
+  .badge.residual { background: #555; }
+  .badge.ner { background: #2d5f8a; }
+
+  .disposition-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .disposition-btns button {
+    flex: 1; min-width: 100px; padding: 10px; border-radius: 6px; border: 2px solid;
+    font-size: 13px; font-weight: 600; cursor: pointer; background: #fff;
+  }
+  button.sensitive { border-color: var(--sensitive); color: var(--sensitive); }
+  button.safe { border-color: var(--safe); color: var(--safe); }
+  button.duplicate { border-color: var(--duplicate); color: var(--duplicate); }
+  button.escalate { border-color: var(--escalate); color: var(--escalate); }
+  button.sensitive.active { background: var(--sensitive); color: #fff; }
+  button.safe.active { background: var(--safe); color: #fff; }
+  button.duplicate.active { background: var(--duplicate); color: #fff; }
+  button.escalate.active { background: var(--escalate); color: #fff; }
+
+  textarea.note {
+    width: 100%; margin-top: 8px; font-size: 13px; padding: 6px;
+    border: 1px solid #ccc; border-radius: 4px; font-family: inherit;
+  }
+
+  .preview-panels { display: flex; gap: 16px; margin-top: 20px; flex-wrap: wrap; }
+  .panel {
+    flex: 1; min-width: 260px; background: #fff; border: 1px solid #ddd;
+    border-radius: 6px; padding: 12px;
+  }
+  .panel h3 { font-size: 13px; margin: 0 0 8px 0; }
+  .panel pre {
+    background: #f6f6f6; padding: 8px; border-radius: 4px; font-size: 11px;
+    overflow-x: auto; margin: 6px 0;
+  }
+  .panel ul { margin: 4px 0; padding-left: 18px; font-size: 12px; }
+  .panel .never-write { color: #888; font-size: 11px; margin-top: 6px; }
+
+  /* Variant A: full-screen one-at-a-time stack */
+  .stack-card {
+    background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 20px;
+    max-width: 640px; margin: 0 auto;
+  }
+  .stack-progress { text-align: center; font-size: 12px; color: #777; margin-bottom: 10px; }
+  .stack-nav { display: flex; justify-content: space-between; margin-top: 14px; }
+  .stack-nav button { padding: 6px 12px; border-radius: 4px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+
+  /* Variant B: master-detail inbox */
+  .inbox { display: flex; gap: 16px; }
+  .inbox-list { width: 280px; border: 1px solid #ddd; border-radius: 6px; background: #fff; overflow: hidden; }
+  .inbox-row {
+    padding: 10px 12px; border-bottom: 1px solid #eee; cursor: pointer; font-size: 13px;
+  }
+  .inbox-row:hover { background: #f5f5f5; }
+  .inbox-row.selected { background: #eef4ff; }
+  .inbox-row .disp-tag {
+    float: right; font-size: 10px; text-transform: uppercase; padding: 1px 5px; border-radius: 3px; color: #fff;
+  }
+  .inbox-detail { flex: 1; background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 16px; }
+
+  /* Variant C: kanban triage board */
+  .board { display: flex; gap: 12px; align-items: flex-start; }
+  .board-col {
+    flex: 1; background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 10px; min-height: 200px;
+  }
+  .board-col h3 { font-size: 12px; text-transform: uppercase; margin: 0 0 8px 0; }
+  .board-card {
+    border: 1px solid #ddd; border-radius: 6px; padding: 8px; margin-bottom: 8px; font-size: 12px;
+    background: #fafafa; cursor: pointer;
+  }
+  .board-card.undecided { border-style: dashed; }
+  .board-col.target { outline: 2px dashed #999; }
+
+  /* floating variant switcher */
+  #switcher {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    background: #111; color: #fff; border-radius: 999px; padding: 8px 6px;
+    display: flex; align-items: center; gap: 4px; box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+    font-size: 13px; z-index: 1000;
+  }
+  #switcher button {
+    background: transparent; border: none; color: #fff; font-size: 16px; cursor: pointer;
+    padding: 4px 12px; border-radius: 999px;
+  }
+  #switcher button:hover { background: rgba(255,255,255,0.15); }
+  #switcher .label { padding: 0 8px; white-space: nowrap; }
+</style>
+</head>
+<body>
+<div class="banner">PROTOTYPE -- throwaway artifact for issue #7 ("Prototype the human reviewer workflow"). Nothing here writes real files.</div>
+<div id="app"></div>
+<div id="switcher"></div>
+
+<script>
+"use strict";
+
+/* Same finding shape as load_findings() in tools/prototype_reviewer_triage.py,
+   flattened from the DEMO_REPORT residuals + ner_review.findings entries. */
+const FINDINGS = [
+  {
+    id: "sanitized_document_01:residual:3:denylist",
+    source: "residual", category: "denylist",
+    shape: "Aaaaa Aaaaa Aaaaaaaaaaa LLC",
+    pages: [3], occurrences: 1, score_max: null,
+    crop: "triage/sanitized_document_01/residual_0001_page0003_denylist.png",
+  },
+  {
+    id: "sanitized_document_01:residual:12:address",
+    source: "residual", category: "address",
+    shape: "999 Aaaaa Aa, Aaaaaaa, XX 99999",
+    pages: [12], occurrences: 1, score_max: null,
+    crop: "triage/sanitized_document_01/residual_0002_page0012_address.png",
+  },
+  {
+    id: "sanitized_document_01:ner:PERSON:Aaaa A. Aaaaaaa",
+    source: "ner", category: "PERSON",
+    shape: "Aaaa A. Aaaaaaa",
+    pages: [1, 4, 9], occurrences: 7, score_max: 0.91,
+    crop: "triage/sanitized_document_01/ner/ner_0001_page0001_person.png",
+  },
+  {
+    id: "sanitized_document_01:ner:ORG:Aaaaaaa Aaaaaaaaxx, Aac.",
+    source: "ner", category: "ORG",
+    shape: "Aaaaaaa Aaaaaaaaxx, Aac.",
+    pages: [2, 5], occurrences: 3, score_max: 0.77,
+    crop: "triage/sanitized_document_01/ner/ner_0002_page0002_org.png",
+  },
+];
+
+const DISPOSITIONS = ["sensitive", "safe", "duplicate", "escalate"];
+
+/* In-memory only -- no persistence, matching the CLI prototype's decisions.json
+   except this never touches disk. Reset on page reload by design. */
+const state = {
+  reviewer: "",
+  decisions: {},   // finding id -> disposition
+  notes: {},       // finding id -> escalate note
+  selected: FINDINGS[0].id,
+};
+
+function decidedCount() {
+  return Object.keys(state.decisions).length;
+}
+
+function findingById(id) {
+  return FINDINGS.find(f => f.id === id);
+}
+
+/* ---------- shared pieces ---------- */
+
+function cropEl(finding) {
+  const div = document.createElement("div");
+  div.className = "crop";
+  const badge = `<span class="badge ${finding.source}">${finding.source}</span>` +
+                `<span style="font-size:11px;color:#888">page(s) ${finding.pages.join(", ")}</span>`;
+  const color = finding.source === "residual" ? "#b4232a" : "#2d5f8a";
+  div.innerHTML = `
+    ${badge}
+    <div class="line"></div>
+    <div class="line short"></div>
+    <span class="highlight" style="border-color:${color};color:${color}">${escapeHtml(finding.shape)}</span>
+    <div class="line short"></div>
+    <div class="crop-missing">crop: ${finding.crop} (not found -- demo data, placeholder shown)</div>
+  `;
+  return div;
+}
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function setDisposition(findingId, disposition, note) {
+  state.decisions[findingId] = disposition;
+  if (disposition === "escalate" && note !== undefined) {
+    state.notes[findingId] = note;
+  }
+  if (disposition !== "escalate") {
+    delete state.notes[findingId];
+  }
+  render();
+}
+
+function dispositionButtons(findingId, current, opts) {
+  opts = opts || {};
+  const wrap = document.createElement("div");
+  wrap.className = "disposition-btns";
+  DISPOSITIONS.forEach(d => {
+    const btn = document.createElement("button");
+    btn.className = d + (current === d ? " active" : "");
+    btn.textContent = d;
+    btn.onclick = () => {
+      if (d === "escalate") {
+        const note = prompt("Escalate -- reason/note for this finding:", state.notes[findingId] || "");
+        if (note === null) return; // cancelled
+        setDisposition(findingId, d, note);
+      } else {
+        setDisposition(findingId, d);
+      }
+    };
+    wrap.appendChild(btn);
+  });
+  return wrap;
+}
+
+function reviewerRow() {
+  const row = document.createElement("div");
+  row.className = "reviewer-row";
+  row.innerHTML = `Reviewer name: <input id="reviewer-input" type="text" placeholder="e.g. sasha" value="${escapeHtml(state.reviewer)}">`;
+  row.querySelector("input").oninput = (e) => { state.reviewer = e.target.value; renderPreviewPanels(); };
+  return row;
+}
+
+function previewPanelsEl() {
+  const wrap = document.createElement("div");
+  wrap.className = "preview-panels";
+  wrap.id = "preview-panels";
+  wrap.appendChild(promotionPanel());
+  wrap.appendChild(manifestPanel());
+  return wrap;
+}
+
+function promotionPanel() {
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  const duplicates = FINDINGS.filter(f => state.decisions[f.id] === "duplicate");
+  const safes = FINDINGS.filter(f => state.decisions[f.id] === "safe");
+  const escalated = FINDINGS.filter(f => state.decisions[f.id] === "escalate");
+  let html = "<h3>Promotion preview</h3>";
+  if (duplicates.length) {
+    html += "<div>Would propose adding to <code>config/denylist.local.json</code>:</div><ul>" +
+      duplicates.map(f => `<li>${f.category}: ${escapeHtml(f.shape)}</li>`).join("") + "</ul>";
+  }
+  if (safes.length) {
+    html += "<div>Would propose adding to a scoped rule / <code>config/lexicons/*.json</code>:</div><ul>" +
+      safes.map(f => `<li>${f.category}: ${escapeHtml(f.shape)}</li>`).join("") + "</ul>";
+  }
+  if (escalated.length) {
+    html += "<div>Escalated (held for a second reviewer, not promoted):</div><ul>" +
+      escalated.map(f => `<li>${f.category}: ${escapeHtml(f.shape)} -- "${escapeHtml(state.notes[f.id] || "")}"</li>`).join("") + "</ul>";
+  }
+  if (!duplicates.length && !safes.length && !escalated.length) {
+    html += "<div style='color:#888;font-size:12px'>No duplicate/safe/escalate decisions yet.</div>";
+  }
+  html += "<div class='never-write'>(Nothing written to policy files by this prototype -- promotion is separate tooling.)</div>";
+  panel.innerHTML = html;
+  return panel;
+}
+
+function manifestPanel() {
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  const status = decidedCount() === FINDINGS.length ? "complete" : "in_progress";
+  const body = {
+    review: {
+      status: status,
+      reviewer: state.reviewer || null,
+      decided: decidedCount(),
+      total: FINDINGS.length,
+      completed_at: status === "complete" ? new Date().toISOString() : null,
+    },
+  };
+  panel.innerHTML = `<h3>Manifest preview</h3><pre>${escapeHtml(JSON.stringify(body, null, 2))}</pre>` +
+    `<div class="never-write">(Preview only -- manifest.json's review field isn't written by this prototype.)</div>`;
+  return panel;
+}
+
+function renderPreviewPanels() {
+  const old = document.getElementById("preview-panels");
+  if (old) old.replaceWith(previewPanelsEl());
+}
+
+/* ---------- Variant A: full-screen one-at-a-time stack ---------- */
+
+function renderVariantA(root) {
+  root.innerHTML = "";
+  const h = document.createElement("h1"); h.textContent = "Reviewer triage -- one at a time";
+  const sub = document.createElement("div"); sub.className = "sub";
+  sub.textContent = "Variant A: a single finding fills the screen; step forward once it has a disposition.";
+  root.appendChild(h); root.appendChild(sub);
+  root.appendChild(reviewerRow());
+
+  const idx = FINDINGS.findIndex(f => f.id === state.selected);
+  const finding = FINDINGS[idx];
+
+  const card = document.createElement("div");
+  card.className = "stack-card";
+  const progress = document.createElement("div");
+  progress.className = "stack-progress";
+  progress.textContent = `Finding ${idx + 1} of ${FINDINGS.length} -- ${decidedCount()} decided`;
+  card.appendChild(progress);
+  card.appendChild(cropEl(finding));
+
+  const meta = document.createElement("div");
+  meta.style.margin = "12px 0";
+  meta.style.fontSize = "13px";
+  meta.innerHTML = `<strong>${finding.category}</strong>` +
+    (finding.occurrences > 1 ? ` -- ${finding.occurrences} occurrences` : "") +
+    (finding.score_max ? `, max score ${finding.score_max}` : "");
+  card.appendChild(meta);
+
+  card.appendChild(dispositionButtons(finding.id, state.decisions[finding.id]));
+
+  const nav = document.createElement("div");
+  nav.className = "stack-nav";
+  const prevBtn = document.createElement("button");
+  prevBtn.textContent = "← previous";
+  prevBtn.disabled = idx === 0;
+  prevBtn.onclick = () => { state.selected = FINDINGS[idx - 1].id; render(); };
+  const nextBtn = document.createElement("button");
+  nextBtn.textContent = "next →";
+  nextBtn.disabled = idx === FINDINGS.length - 1;
+  nextBtn.onclick = () => { state.selected = FINDINGS[idx + 1].id; render(); };
+  nav.appendChild(prevBtn); nav.appendChild(nextBtn);
+  card.appendChild(nav);
+
+  root.appendChild(card);
+  root.appendChild(previewPanelsEl());
+}
+
+/* ---------- Variant B: master-detail inbox ---------- */
+
+function renderVariantB(root) {
+  root.innerHTML = "";
+  const h = document.createElement("h1"); h.textContent = "Reviewer triage -- inbox";
+  const sub = document.createElement("div"); sub.className = "sub";
+  sub.textContent = "Variant B: jump to any finding in any order; the list shows decisions made so far.";
+  root.appendChild(h); root.appendChild(sub);
+  root.appendChild(reviewerRow());
+
+  const inbox = document.createElement("div");
+  inbox.className = "inbox";
+
+  const list = document.createElement("div");
+  list.className = "inbox-list";
+  FINDINGS.forEach(f => {
+    const row = document.createElement("div");
+    row.className = "inbox-row" + (f.id === state.selected ? " selected" : "");
+    const disp = state.decisions[f.id];
+    row.innerHTML = `<span class="badge ${f.source}">${f.source}</span>${f.category}` +
+      (disp ? `<span class="disp-tag" style="background:var(--${disp})">${disp}</span>` : "");
+    row.onclick = () => { state.selected = f.id; render(); };
+    list.appendChild(row);
+  });
+  inbox.appendChild(list);
+
+  const detail = document.createElement("div");
+  detail.className = "inbox-detail";
+  const finding = findingById(state.selected);
+  detail.appendChild(cropEl(finding));
+  const meta = document.createElement("div");
+  meta.style.margin = "12px 0";
+  meta.style.fontSize = "13px";
+  meta.innerHTML = `<strong>${finding.shape}</strong> -- pages ${finding.pages.join(", ")}` +
+    (finding.occurrences > 1 ? `, ${finding.occurrences} occurrences` : "") +
+    (finding.score_max ? `, max score ${finding.score_max}` : "");
+  detail.appendChild(meta);
+  detail.appendChild(dispositionButtons(finding.id, state.decisions[finding.id]));
+  inbox.appendChild(detail);
+
+  root.appendChild(inbox);
+  root.appendChild(previewPanelsEl());
+}
+
+/* ---------- Variant C: kanban triage board ---------- */
+
+let boardSelection = null;
+
+function renderVariantC(root) {
+  root.innerHTML = "";
+  const h = document.createElement("h1"); h.textContent = "Reviewer triage -- board";
+  const sub = document.createElement("div"); sub.className = "sub";
+  sub.textContent = "Variant C: click a finding, then click a column to place it there. All findings visible at once.";
+  root.appendChild(h); root.appendChild(sub);
+  root.appendChild(reviewerRow());
+
+  const board = document.createElement("div");
+  board.className = "board";
+
+  const undecidedCol = document.createElement("div");
+  undecidedCol.className = "board-col";
+  undecidedCol.innerHTML = "<h3>Undecided</h3>";
+  FINDINGS.filter(f => !state.decisions[f.id]).forEach(f => {
+    undecidedCol.appendChild(boardCard(f, true));
+  });
+  board.appendChild(undecidedCol);
+
+  DISPOSITIONS.forEach(d => {
+    const col = document.createElement("div");
+    col.className = "board-col" + (boardSelection ? " target" : "");
+    col.innerHTML = `<h3 style="color:var(--${d})">${d}</h3>`;
+    col.onclick = (e) => {
+      if (!boardSelection || e.target !== col) return;
+      if (d === "escalate") {
+        const note = prompt("Escalate -- reason/note for this finding:", "");
+        if (note === null) return;
+        setDisposition(boardSelection, d, note);
+      } else {
+        setDisposition(boardSelection, d);
+      }
+      boardSelection = null;
+    };
+    FINDINGS.filter(f => state.decisions[f.id] === d).forEach(f => col.appendChild(boardCard(f, false)));
+    board.appendChild(col);
+  });
+
+  root.appendChild(board);
+  root.appendChild(previewPanelsEl());
+}
+
+function boardCard(finding, undecided) {
+  const card = document.createElement("div");
+  card.className = "board-card" + (undecided ? " undecided" : "") + (boardSelection === finding.id ? " selected" : "");
+  card.style.outline = boardSelection === finding.id ? "2px solid #333" : "none";
+  card.innerHTML = `<span class="badge ${finding.source}">${finding.source}</span>${finding.category}<br>` +
+    `<span style="color:#666">${escapeHtml(finding.shape)}</span>`;
+  card.onclick = (e) => {
+    e.stopPropagation();
+    boardSelection = (boardSelection === finding.id) ? null : finding.id;
+    renderVariantC(document.getElementById("app"));
+    renderSwitcher();
+  };
+  return card;
+}
+
+/* ---------- variant switcher ---------- */
+
+const VARIANTS = {
+  A: { render: renderVariantA, name: "Full-screen stack" },
+  B: { render: renderVariantB, name: "Master-detail inbox" },
+  C: { render: renderVariantC, name: "Kanban board" },
+};
+const ORDER = ["A", "B", "C"];
+
+function getVariant() {
+  const v = new URLSearchParams(location.search).get("variant");
+  return VARIANTS[v] ? v : "A";
+}
+
+function setVariant(v) {
+  boardSelection = null;
+  try {
+    const url = new URL(location.href);
+    url.searchParams.set("variant", v);
+    history.replaceState(null, "", url);
+  } catch (e) { /* file:// may not support history API in some browsers -- ignore */ }
+  render();
+}
+
+function renderSwitcher() {
+  const bar = document.getElementById("switcher");
+  const v = getVariant();
+  bar.innerHTML = "";
+  const left = document.createElement("button");
+  left.textContent = "←";
+  left.onclick = () => cycle(-1);
+  const label = document.createElement("span");
+  label.className = "label";
+  label.textContent = `${v} -- ${VARIANTS[v].name}`;
+  const right = document.createElement("button");
+  right.textContent = "→";
+  right.onclick = () => cycle(1);
+  bar.appendChild(left); bar.appendChild(label); bar.appendChild(right);
+}
+
+function cycle(dir) {
+  const i = ORDER.indexOf(getVariant());
+  const next = ORDER[(i + dir + ORDER.length) % ORDER.length];
+  setVariant(next);
+}
+
+document.addEventListener("keydown", (e) => {
+  const tag = (e.target.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "textarea" || e.target.isContentEditable) return;
+  if (e.key === "ArrowLeft") cycle(-1);
+  if (e.key === "ArrowRight") cycle(1);
+});
+
+function render() {
+  const v = getVariant();
+  VARIANTS[v].render(document.getElementById("app"));
+  renderSwitcher();
+}
+
+render();
+</script>
+</body>
+</html>
