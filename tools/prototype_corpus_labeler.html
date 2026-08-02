@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PROTOTYPE -- corpus labeling tool (issue #11)</title>
+<style>
+  :root {
+    --sensitive: #b4232a;
+    --safe: #1f7a3f;
+    --ink: #1c1c1c;
+    --paper: #faf8f3;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    margin: 0; padding: 0;
+    background: #eee; color: var(--ink);
+  }
+  .banner {
+    background: #222; color: #ffd54a; text-align: center;
+    font-size: 12px; padding: 4px; letter-spacing: 0.03em;
+  }
+  #app { max-width: 1200px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 20px; margin: 0 0 4px 0; }
+  .sub { color: #555; font-size: 14px; margin-bottom: 18px; }
+
+  .layout { display: flex; gap: 18px; align-items: flex-start; }
+  .page-col { flex: 0 0 auto; }
+  .side-col { flex: 1; min-width: 320px; }
+
+  #pageCanvas {
+    background: var(--paper);
+    border: 1px solid #d8d2c2;
+    cursor: crosshair;
+    display: block;
+  }
+  .canvas-caption { font-size: 12px; color: #666; margin-top: 6px; max-width: 720px; }
+
+  .panel {
+    background: #fff; border: 1px solid #ddd; border-radius: 6px;
+    padding: 14px; margin-bottom: 14px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 10px 0; }
+  .field { margin-bottom: 10px; }
+  .field label { display: block; font-size: 12px; color: #555; margin-bottom: 3px; }
+  .field select, .field input[type=text] {
+    width: 100%; padding: 6px 8px; font-size: 13px; border: 1px solid #ccc; border-radius: 4px;
+  }
+  .radio-row { display: flex; gap: 14px; font-size: 13px; }
+  .radio-row label { display: flex; align-items: center; gap: 5px; font-size: 13px; color: var(--ink); margin: 0; }
+
+  .btn-row { display: flex; gap: 8px; margin-top: 12px; }
+  button {
+    padding: 8px 14px; border-radius: 5px; border: 1px solid #999;
+    background: #fff; font-size: 13px; cursor: pointer;
+  }
+  button.primary { background: #2255aa; border-color: #2255aa; color: #fff; font-weight: 600; }
+  button.danger { color: var(--sensitive); border-color: var(--sensitive); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .item-list { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; }
+  .item-list li {
+    padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 12.5px;
+    display: flex; justify-content: space-between; gap: 8px; align-items: center;
+  }
+  .item-list li:hover { background: #f7f7f7; }
+  .tag {
+    display: inline-block; padding: 1px 6px; border-radius: 3px; font-weight: 600;
+    font-size: 11px; margin-left: 6px;
+  }
+  .tag.sensitive { background: #fde7e7; color: var(--sensitive); }
+  .tag.not_sensitive { background: #e6f4ea; color: var(--safe); }
+  .item-del { color: #999; cursor: pointer; font-size: 14px; }
+  .item-del:hover { color: var(--sensitive); }
+
+  textarea.export {
+    width: 100%; height: 220px; font-family: "SF Mono", Menlo, monospace;
+    font-size: 11.5px; padding: 8px; border: 1px solid #ccc; border-radius: 4px;
+    resize: vertical; background: #1c1c1c; color: #d8f0d8;
+  }
+  .empty-note { font-size: 13px; color: #888; padding: 10px 0; }
+</style>
+</head>
+<body>
+<div class="banner">PROTOTYPE -- throwaway artifact for issue #11 ("Prototype the Phase 3 corpus labeling tool"). Nothing here writes real files; the page below is a synthetic placeholder, not a real document.</div>
+<div id="app">
+  <h1>Corpus labeling tool -- round 1 sketch</h1>
+  <div class="sub">
+    Draw a box on the placeholder page, then tag it: category, sensitivity decision, expected
+    disposition. Matches the schema locked in issue #5 (bbox + category + sensitivity + disposition
+    per item), replacing the flat-string <code>tests/golden/mlk_labels.json</code> approach.
+    On a real corpus item, the boxed region would be rendered the same way
+    <code>render_residual_crop()</code> (tools/anonymize_construction_pdfs.py) already rasterizes
+    residual regions from a PDF page -- this demo page is a stand-in since no locked-corpus PDF exists yet.
+  </div>
+
+  <div class="layout">
+    <div class="page-col">
+      <canvas id="pageCanvas" width="720" height="960"></canvas>
+      <div class="canvas-caption">
+        Synthetic placeholder page: title block (top right), a schedule table, a body paragraph,
+        a manufacturer stamp, and a signature line -- standing in for the Phase 3 dimension table's
+        layout variety (title blocks, tables, stamps, body prose).
+      </div>
+    </div>
+
+    <div class="side-col">
+      <div class="panel" id="formPanel" style="display:none;">
+        <h2>Tag this box</h2>
+        <div class="field">
+          <label for="category">Category</label>
+          <select id="category">
+            <optgroup label="Sensitive-leaning">
+              <option value="person">Person name</option>
+              <option value="firm">Firm / company name</option>
+              <option value="project">Project identifier</option>
+              <option value="address">Address</option>
+              <option value="contact">Contact info (phone / email)</option>
+              <option value="account_id">Account / ID number</option>
+              <option value="path">File path</option>
+              <option value="signature">Signature</option>
+              <option value="barcode">Barcode / QR</option>
+            </optgroup>
+            <optgroup label="Negative-leaning">
+              <option value="manufacturer">Manufacturer / brand</option>
+              <option value="standard">Standard / code reference</option>
+              <option value="schedule">Schedule / table cell</option>
+              <option value="boilerplate">Boilerplate text</option>
+              <option value="structural">Structural artifact (dimension, section code)</option>
+              <option value="garbage">OCR / extraction garbage</option>
+            </optgroup>
+            <option value="other">Other (see note)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Sensitivity decision</label>
+          <div class="radio-row">
+            <label><input type="radio" name="sensitivity" value="sensitive" checked> Sensitive</label>
+            <label><input type="radio" name="sensitivity" value="not_sensitive"> Not sensitive</label>
+          </div>
+        </div>
+        <div class="field">
+          <label>Expected disposition</label>
+          <div class="radio-row">
+            <label><input type="radio" name="disposition" value="redact" checked> Redact</label>
+            <label><input type="radio" name="disposition" value="keep"> Keep</label>
+          </div>
+        </div>
+        <div class="field">
+          <label for="note">Note (optional -- e.g. why sensitivity and disposition diverge, a hard-negative case)</label>
+          <input type="text" id="note" placeholder="e.g. looks like an identifier but is boilerplate">
+        </div>
+        <div class="btn-row">
+          <button class="primary" id="saveItem">Save labeled item</button>
+          <button id="cancelItem">Cancel</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Labeled items (<span id="itemCount">0</span>)</h2>
+        <ul class="item-list" id="itemList"></ul>
+        <div class="empty-note" id="emptyNote">Draw a box on the page to add the first item.</div>
+      </div>
+
+      <div class="panel">
+        <h2>Export preview (schema per item: bbox, category, sensitivity, disposition, note)</h2>
+        <textarea class="export" id="exportBox" readonly></textarea>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const canvas = document.getElementById("pageCanvas");
+const ctx = canvas.getContext("2d");
+
+function drawPlaceholderPage() {
+  ctx.fillStyle = "#faf8f3";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Title block, top right.
+  ctx.strokeStyle = "#999";
+  ctx.strokeRect(470, 20, 230, 110);
+  ctx.fillStyle = "#333";
+  ctx.font = "12px monospace";
+  ctx.fillText("TITLE BLOCK", 485, 40);
+  ["PROJECT: -----------", "SHEET: A-101", "DATE: --/--/----"].forEach((line, i) => {
+    ctx.fillText(line, 485, 62 + i * 18);
+  });
+
+  // Body paragraph, left.
+  ctx.fillStyle = "#ddd7c8";
+  for (let i = 0; i < 8; i++) {
+    const w = i === 7 ? 160 : 380;
+    ctx.fillRect(30, 160 + i * 16, w, 8);
+  }
+
+  // Schedule table, mid page.
+  const tableTop = 340, tableLeft = 30, cols = 4, rows = 5, colW = 160, rowH = 28;
+  ctx.strokeStyle = "#b7b0a0";
+  for (let r = 0; r <= rows; r++) {
+    ctx.beginPath();
+    ctx.moveTo(tableLeft, tableTop + r * rowH);
+    ctx.lineTo(tableLeft + cols * colW, tableTop + r * rowH);
+    ctx.stroke();
+  }
+  for (let c = 0; c <= cols; c++) {
+    ctx.beginPath();
+    ctx.moveTo(tableLeft + c * colW, tableTop);
+    ctx.lineTo(tableLeft + c * colW, tableTop + rows * rowH);
+    ctx.stroke();
+  }
+  ctx.font = "11px monospace";
+  ctx.fillStyle = "#555";
+  ctx.fillText("SCHEDULE", tableLeft + 4, tableTop - 6);
+
+  // Manufacturer stamp, bottom left (circle).
+  ctx.beginPath();
+  ctx.arc(110, 640, 55, 0, Math.PI * 2);
+  ctx.strokeStyle = "#888";
+  ctx.stroke();
+  ctx.font = "10px monospace";
+  ctx.fillStyle = "#666";
+  ctx.fillText("ACME MFG", 78, 636);
+  ctx.fillText("CERTIFIED", 78, 650);
+
+  // Signature line, bottom right.
+  ctx.beginPath();
+  ctx.moveTo(430, 700);
+  ctx.lineTo(650, 700);
+  ctx.strokeStyle = "#999";
+  ctx.stroke();
+  ctx.font = "10px monospace";
+  ctx.fillStyle = "#777";
+  ctx.fillText("Signature", 430, 715);
+
+  // Footer boilerplate.
+  ctx.font = "9px monospace";
+  ctx.fillStyle = "#999";
+  ctx.fillText("This drawing is confidential and remains the property of the issuing firm...", 30, 900);
+}
+
+function redraw() {
+  drawPlaceholderPage();
+  items.forEach((item) => paintBox(item.bbox, item.sensitivity === "sensitive" ? "#b4232a" : "#1f7a3f"));
+  if (draftBox) paintBox(draftBox, "#2255aa", true);
+}
+
+function paintBox(bbox, color, dashed) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  if (dashed) ctx.setLineDash([5, 4]);
+  ctx.strokeRect(bbox[0], bbox[1], bbox[2] - bbox[0], bbox[3] - bbox[1]);
+  ctx.restore();
+}
+
+let items = [];
+let dragStart = null;
+let draftBox = null;
+let nextId = 1;
+
+canvas.addEventListener("mousedown", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  dragStart = [e.clientX - rect.left, e.clientY - rect.top];
+  draftBox = null;
+  document.getElementById("formPanel").style.display = "none";
+});
+
+canvas.addEventListener("mousemove", (e) => {
+  if (!dragStart) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  draftBox = [Math.min(dragStart[0], x), Math.min(dragStart[1], y), Math.max(dragStart[0], x), Math.max(dragStart[1], y)];
+  redraw();
+});
+
+canvas.addEventListener("mouseup", () => {
+  if (draftBox && (draftBox[2] - draftBox[0] > 6) && (draftBox[3] - draftBox[1] > 6)) {
+    document.getElementById("formPanel").style.display = "block";
+    document.getElementById("category").value = "person";
+    document.querySelector('input[name=sensitivity][value=sensitive]').checked = true;
+    document.querySelector('input[name=disposition][value=redact]').checked = true;
+    document.getElementById("note").value = "";
+  } else {
+    draftBox = null;
+    redraw();
+  }
+  dragStart = null;
+});
+
+document.getElementById("saveItem").addEventListener("click", () => {
+  if (!draftBox) return;
+  items.push({
+    id: `item-${String(nextId++).padStart(3, "0")}`,
+    bbox: draftBox.map((v) => Math.round(v)),
+    category: document.getElementById("category").value,
+    sensitivity: document.querySelector('input[name=sensitivity]:checked').value,
+    disposition: document.querySelector('input[name=disposition]:checked').value,
+    note: document.getElementById("note").value || null,
+  });
+  draftBox = null;
+  document.getElementById("formPanel").style.display = "none";
+  renderItems();
+  redraw();
+});
+
+document.getElementById("cancelItem").addEventListener("click", () => {
+  draftBox = null;
+  document.getElementById("formPanel").style.display = "none";
+  redraw();
+});
+
+function renderItems() {
+  const list = document.getElementById("itemList");
+  const empty = document.getElementById("emptyNote");
+  list.innerHTML = "";
+  document.getElementById("itemCount").textContent = items.length;
+  empty.style.display = items.length ? "none" : "block";
+  items.forEach((item, idx) => {
+    const li = document.createElement("li");
+    li.innerHTML = `<span>${item.category}<span class="tag ${item.sensitivity}">${item.sensitivity === "sensitive" ? "sensitive" : "not sensitive"}</span> &rarr; ${item.disposition}</span><span class="item-del" data-idx="${idx}">&times;</span>`;
+    list.appendChild(li);
+  });
+  list.querySelectorAll(".item-del").forEach((el) => {
+    el.addEventListener("click", () => {
+      items.splice(Number(el.dataset.idx), 1);
+      renderItems();
+      redraw();
+    });
+  });
+  document.getElementById("exportBox").value = JSON.stringify(items, null, 2);
+}
+
+drawPlaceholderPage();
+renderItems();
+</script>
+</body>
+</html>
