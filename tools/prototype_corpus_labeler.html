@@ -9,82 +9,86 @@
     --safe: #1f7a3f;
     --ink: #1c1c1c;
     --paper: #faf8f3;
+    --accent: #2255aa;
   }
   * { box-sizing: border-box; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     margin: 0; padding: 0;
-    background: #eee; color: var(--ink);
+    background: #f0f0ee; color: var(--ink);
   }
   .banner {
     background: #222; color: #ffd54a; text-align: center;
-    font-size: 12px; padding: 4px; letter-spacing: 0.03em;
+    font-size: 12px; padding: 5px; letter-spacing: 0.03em;
   }
-  #app { max-width: 1200px; margin: 0 auto; padding: 20px; }
-  h1 { font-size: 20px; margin: 0 0 4px 0; }
-  .sub { color: #555; font-size: 14px; margin-bottom: 18px; }
+  #app { max-width: 1200px; margin: 0 auto; padding: 26px 20px 40px; }
+  h1 { font-size: 21px; margin: 0 0 6px 0; letter-spacing: -0.01em; }
+  .sub { color: #5a5a5a; font-size: 13.5px; line-height: 1.5; margin-bottom: 22px; max-width: 900px; }
 
-  .layout { display: flex; gap: 18px; align-items: flex-start; }
+  .layout { display: flex; gap: 22px; align-items: flex-start; }
   .page-col { flex: 0 0 auto; }
   .side-col { flex: 1; min-width: 320px; }
 
   #pageCanvas {
     background: var(--paper);
     border: 1px solid #d8d2c2;
+    border-radius: 3px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
     cursor: crosshair;
     display: block;
   }
-  .canvas-caption { font-size: 12px; color: #666; margin-top: 6px; max-width: 720px; }
+  .canvas-caption { font-size: 12px; color: #777; margin-top: 8px; max-width: 720px; line-height: 1.4; }
 
   .panel {
-    background: #fff; border: 1px solid #ddd; border-radius: 6px;
-    padding: 14px; margin-bottom: 14px;
+    background: #fff; border: 1px solid #e2e2e2; border-radius: 8px;
+    padding: 16px; margin-bottom: 16px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
   }
-  .panel h2 { font-size: 14px; margin: 0 0 10px 0; }
-  .field { margin-bottom: 10px; }
-  .field label { display: block; font-size: 12px; color: #555; margin-bottom: 3px; }
+  .panel h2 { font-size: 13.5px; margin: 0 0 12px 0; color: #333; }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; font-size: 12px; color: #666; margin-bottom: 4px; }
   .field select, .field input[type=text] {
-    width: 100%; padding: 6px 8px; font-size: 13px; border: 1px solid #ccc; border-radius: 4px;
+    width: 100%; padding: 7px 9px; font-size: 13px; border: 1px solid #d3d3d3; border-radius: 5px;
   }
-  .radio-row { display: flex; gap: 14px; font-size: 13px; }
+  .field select:focus, .field input[type=text]:focus { outline: none; border-color: var(--accent); }
+  .radio-row { display: flex; gap: 16px; font-size: 13px; }
   .radio-row label { display: flex; align-items: center; gap: 5px; font-size: 13px; color: var(--ink); margin: 0; }
 
-  .btn-row { display: flex; gap: 8px; margin-top: 12px; }
+  .btn-row { display: flex; gap: 8px; margin-top: 14px; }
   button {
-    padding: 8px 14px; border-radius: 5px; border: 1px solid #999;
-    background: #fff; font-size: 13px; cursor: pointer;
+    padding: 8px 15px; border-radius: 6px; border: 1px solid #ccc;
+    background: #fff; font-size: 13px; cursor: pointer; transition: background 0.1s;
   }
-  button.primary { background: #2255aa; border-color: #2255aa; color: #fff; font-weight: 600; }
-  button.danger { color: var(--sensitive); border-color: var(--sensitive); }
+  button:hover { background: #f5f5f5; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover { background: #1c468c; }
   button:disabled { opacity: 0.4; cursor: not-allowed; }
 
-  .item-list { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; }
+  .item-list { list-style: none; margin: 0; padding: 0; max-height: 280px; overflow-y: auto; }
   .item-list li {
-    padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 12.5px;
+    padding: 9px 4px; border-bottom: 1px solid #f0f0f0; font-size: 12.5px;
     display: flex; justify-content: space-between; gap: 8px; align-items: center;
   }
-  .item-list li:hover { background: #f7f7f7; }
+  .item-list li:last-child { border-bottom: none; }
+  .item-list li:hover { background: #fafafa; }
   .tag {
-    display: inline-block; padding: 1px 6px; border-radius: 3px; font-weight: 600;
-    font-size: 11px; margin-left: 6px;
+    display: inline-block; padding: 1px 7px; border-radius: 10px; font-weight: 600;
+    font-size: 10.5px; margin-left: 7px;
   }
   .tag.sensitive { background: #fde7e7; color: var(--sensitive); }
   .tag.not_sensitive { background: #e6f4ea; color: var(--safe); }
-  .item-del { color: #999; cursor: pointer; font-size: 14px; }
+  .item-del { color: #bbb; cursor: pointer; font-size: 15px; padding: 0 4px; }
   .item-del:hover { color: var(--sensitive); }
 
-  textarea.export {
-    width: 100%; height: 220px; font-family: "SF Mono", Menlo, monospace;
-    font-size: 11.5px; padding: 8px; border: 1px solid #ccc; border-radius: 4px;
-    resize: vertical; background: #1c1c1c; color: #d8f0d8;
-  }
-  .empty-note { font-size: 13px; color: #888; padding: 10px 0; }
+  .panel-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; }
+  .export-status { font-size: 12px; color: #1f7a3f; }
+  .empty-note { font-size: 13px; color: #999; padding: 12px 0; }
 </style>
 </head>
 <body>
 <div class="banner">PROTOTYPE -- throwaway artifact for issue #11 ("Prototype the Phase 3 corpus labeling tool"). Nothing here writes real files; the page below is a synthetic placeholder, not a real document.</div>
 <div id="app">
-  <h1>Corpus labeling tool -- round 1 sketch</h1>
+  <h1>Corpus labeling tool -- round 2 sketch</h1>
   <div class="sub">
     Draw a box on the placeholder page, then tag it: category, sensitivity decision, expected
     disposition. Matches the schema locked in issue #5 (bbox + category + sensitivity + disposition
@@ -160,11 +164,10 @@
         <h2>Labeled items (<span id="itemCount">0</span>)</h2>
         <ul class="item-list" id="itemList"></ul>
         <div class="empty-note" id="emptyNote">Draw a box on the page to add the first item.</div>
-      </div>
-
-      <div class="panel">
-        <h2>Export preview (schema per item: bbox, category, sensitivity, disposition, note)</h2>
-        <textarea class="export" id="exportBox" readonly></textarea>
+        <div class="panel-footer">
+          <button class="primary" id="exportItems" disabled>Export labeled items</button>
+          <span class="export-status" id="exportStatus"></span>
+        </div>
       </div>
     </div>
   </div>
@@ -319,6 +322,8 @@ function renderItems() {
   list.innerHTML = "";
   document.getElementById("itemCount").textContent = items.length;
   empty.style.display = items.length ? "none" : "block";
+  document.getElementById("exportItems").disabled = items.length === 0;
+  document.getElementById("exportStatus").textContent = "";
   items.forEach((item, idx) => {
     const li = document.createElement("li");
     li.innerHTML = `<span>${item.category}<span class="tag ${item.sensitivity}">${item.sensitivity === "sensitive" ? "sensitive" : "not sensitive"}</span> &rarr; ${item.disposition}</span><span class="item-del" data-idx="${idx}">&times;</span>`;
@@ -331,8 +336,18 @@ function renderItems() {
       redraw();
     });
   });
-  document.getElementById("exportBox").value = JSON.stringify(items, null, 2);
 }
+
+document.getElementById("exportItems").addEventListener("click", () => {
+  const blob = new Blob([JSON.stringify(items, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "corpus_labels_export.json";
+  a.click();
+  URL.revokeObjectURL(url);
+  document.getElementById("exportStatus").textContent = `Saved ${items.length} item${items.length === 1 ? "" : "s"}.`;
+});
 
 drawPlaceholderPage();
 renderItems();
