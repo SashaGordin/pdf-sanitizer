@@ -45,6 +45,30 @@ their own caveats (paywalls, age, weaker coverage of contemporary sensitive-cont
 | **Federal GSA / SAM.gov construction solicitations** | GSA Public Buildings Service design/construction contracts are advertised on SAM.gov. Solicitation notices themselves are searchable by anyone without an account. | Not verified this pass. | Would plausibly cover federal-agency party info, contact data (contracting officer names/emails are typically in these packages), stamps | **Actual drawings/specs for many federal solicitations require SAM.gov registration or a separate secure document request** (confirmed via search: "you'll need to register on SAM.gov to obtain access to drawings and specifications," and some are marked for controlled/classified distribution) — likely gated beyond the notice itself; needs per-solicitation verification, and some may not be freely redistributable even if viewable. | [sam.gov/opportunities](https://sam.gov/opportunities) |
 | **PlanetBids-hosted municipal/county portals generally** (many CA cities/counties) | Common vendor-portal software used by public agencies; PlanetBids' own documentation states the public does not need to register to view certain public bid information/documents, but whether full plan/spec downloads are gated is configured per agency. | Not systematically surveyed — generic pattern, not a specific verified project. | Same profile as other municipal sources when configured for public access | **Access is agency-configured** — some cities require vendor registration even to download documents; must be checked per agency/project rather than assumed public. | [planetbids.com](https://www.planetbids.com/) |
 
+## Client-provided candidates
+
+Six real spec/project-manual PDFs supplied directly by the client (Taylor Construction's
+contact), added after this memo's first pass. The client's own framing: these are representative
+of what's *publicly* obtainable — his company's actual (larger) projects have specs that are
+private/protected, and public postings only exist at this smaller/mid-size scale. That matches
+the pattern already seen above (368-599 pages per verified portal candidate) and sets a realistic
+ceiling on how large any real document in the locked corpus can be.
+
+| Source | Pages | What it is / why public | Dimension-table relevance | Caveats |
+|---|---|---|---|---|
+| State of California, Dept. of General Services — DSH-Atascadero Re-Roof/HVAC/Electrical Upgrades (`1 142452  Project Manual Book I.pdf`) | 208 | Project Manual Book I of III, same CA DGS bid-portal profile as the memo's verified San Diego project — a second, independent project from the same agency. | PDF construction, layout, sensitive content, negative content — same profile as the verified CA DGS candidate above | None beyond the general portal-freshness caveat |
+| Illinois Capital Development Board (using agency: IDOT) — Stevenson Yard Maintenance Facility, McCook, IL (`21-project-manual.pdf`) | 203 | State-agency "bridging documents" outline specification for a state-owned facility; new state (Illinois) and new agency type (state capital-development board) not covered by the original portal survey. | Sensitive content (named state agency, using agency, address), layout, negative content | None identified |
+| City of St. Charles School District R-VI, Missouri — TL Hardin Middle School alterations (`Hardin-Project-Manual-Vol-1.pdf`) | 181 | School-district bid project manual, same public-procurement logic as MLK; independently confirms the school-district candidate type the original survey could only partially verify. | Sensitive content (district, school, project names, address), layout, negative content | **Carries an explicit copyright / reproduction-restriction notice from the design firm** ("COPYRIGHT © 2024 BY BLDD-DHA ARCHITECTS ... NO PART MAY BE REPRODUCED ... WITHOUT THE WRITTEN PERMISSION OF THE AUTHOR"). More explicit than the boilerplate copyright any of these specs likely carries — flag for licensing review before use, same "flag, don't block" treatment as the AGPL ticket's (#4) open nuance. |
+| Philippines, Bureau of Internal Revenue, Revenue District Office No. 14 — technical specification (`RDO14-TECHSPECS_1.pdf`) | 647 | National-government technical specification, public procurement outside the US; largest single document surveyed to date. | Negative content (CSI-style divisions/sections), layout, PDF construction | Still English-language text, so doesn't close the memo's "non-English document" gap; foreign-agency naming conventions may differ from US party-identifying patterns |
+| Quezon City (Philippines), Dept. of Engineering — Fairview Sentrong Sigla Health Center rehabilitation (`25-00037-SECTION-VI.-SPECIFICATIONS.pdf`) | 30 | Local-government bid specification, public procurement. | **Image quality** — visibly scanned and poorly OCR'd (garbled extracted text), a real example of the "scanned/skewed/low-contrast" dimension cell the original survey found no US source for. Also sensitive content (named agency, project, address). | Small (30 pp); best used as an image-quality supplement rather than a corpus backbone, same role the memo assigned to HABS/HAER material |
+| City of Corvallis, Oregon, Dept. of Public Works — standing Construction Specifications (`Construction Specifications Jan 2026.pdf`) | 352 | Citywide standing construction-specifications manual (effective for all City of Corvallis public-works contracts/permits from March 2026), not a single project's bid package. | Layout, negative content (standards/manufacturer references) — same role as the DOT standard-plan candidates | **Weak on sensitive/party-identifying content**, same caveat as the DOT standard-plans candidate — this is a generic standards document, not tied to one project/party |
+
+Combined with the two portal examples verified earlier in this memo, the survey now has **8
+concrete real documents across 7 distinct agencies/jurisdictions** (CA DGS ×2 projects, Miami-Dade
+County, Illinois Capital Development Board, a Missouri school district, City of Corvallis OR, and
+two Philippine government bodies), totaling roughly **2,600 pages** — real supply spanning state,
+county, city, school-district, and foreign-national/local agency types.
+
 ## Verification needed
 
 - **SCDOT "Falcon" as-let plans archive** — explicitly paywalled ($60/year subscription per the
@@ -83,3 +107,8 @@ their own caveats (paywalls, age, weaker coverage of contemporary sensitive-cont
   taken down or moved once a project is awarded. Anything sourced from here should be captured
   (downloaded and hashed) promptly and its provenance recorded, since the live URL is not a stable
   long-term reference.
+- **Hardin Middle School Project Manual's explicit reproduction-restriction notice** — the design
+  firm's copyright block is more explicit than typical spec boilerplate. Needs the same
+  not-yet-resolved legal-counsel review flagged elsewhere in this map (see ticket #4) before this
+  specific document is used, even though it was obtained via the same public-bid logic as the
+  other candidates.
