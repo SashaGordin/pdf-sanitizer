@@ -30,7 +30,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Mapping, Sequence
 
 try:
     import fitz  # PyMuPDF
@@ -174,7 +174,11 @@ def automated_gate_status(checks: dict[str, bool]) -> str:
     return RELEASE_STATUS_AUTOMATED_PASS if all(checks.values()) else RELEASE_STATUS_FAIL
 
 
-def derive_release_status(automated_status: str, review: dict | None = None) -> str:
+def derive_release_status(
+    automated_status: str,
+    review: dict | None = None,
+    incompleteness_reasons: Sequence[str] = (),
+) -> str:
     """The outward release status for a run, folding automated results
     together with review state.
 
@@ -182,12 +186,18 @@ def derive_release_status(automated_status: str, review: dict | None = None) -> 
     the manifest's review fields (populated outside this tool — no reviewer
     UI is in scope). Its `status` key, once present, is "complete" or
     "incomplete".
+
+    `incompleteness_reasons`, when non-empty, blocks RELEASED the same way an
+    unfinished review does — e.g. a truncated residual/NER review list, or
+    an unresolved project-intake gate — even once review is "complete".
     """
     if automated_status != RELEASE_STATUS_AUTOMATED_PASS:
         return RELEASE_STATUS_FAIL
     if not review or not review.get("status"):
         return RELEASE_STATUS_REVIEW_REQUIRED
     if review["status"] != "complete":
+        return RELEASE_STATUS_REVIEW_INCOMPLETE
+    if incompleteness_reasons:
         return RELEASE_STATUS_REVIEW_INCOMPLETE
     return RELEASE_STATUS_RELEASED
 
@@ -719,6 +729,8 @@ DEFAULT_NER_LABELS: tuple[str, ...] = (
     "project name", "street address", "city",
 )
 
+DEFAULT_MAX_FINDINGS = 500
+
 
 @dataclass(frozen=True)
 class NerSettings:
@@ -729,7 +741,18 @@ class NerSettings:
     model_dir: str = "models/gliner_multi_pii-v1"
     labels: tuple[str, ...] = DEFAULT_NER_LABELS
     threshold: float = 0.5
-    max_findings: int = 500
+    # Per-label distinct-finding caps, keyed by label; "_default" applies to
+    # any label with no explicit entry. Keeps a high-volume label (e.g.
+    # "organization") from crowding out a low-volume, high-value one (e.g.
+    # "street address") under one shared budget.
+    max_findings: Mapping[str, int] = field(default_factory=lambda: {"_default": DEFAULT_MAX_FINDINGS})
+
+
+def ner_cap_for_label(caps: Mapping[str, int], label: str) -> int:
+    """The distinct-finding cap for `label`, falling back to the caps
+    mapping's own "_default" entry, or DEFAULT_MAX_FINDINGS if that too is
+    absent."""
+    return caps.get(label, caps.get("_default", DEFAULT_MAX_FINDINGS))
 
 
 @dataclass(frozen=True)
@@ -1133,14 +1156,24 @@ def load_settings(path: Path) -> Settings:
         normalized(str(value)) for value in ner_raw.get("labels", DEFAULT_NER_LABELS)
         if normalized(str(value))
     )
+    max_findings_raw = ner_raw.get("max_findings", {"_default": DEFAULT_MAX_FINDINGS})
+    if not isinstance(max_findings_raw, dict):
+        raise SystemExit("Sanitizer configuration could not be read")
+    try:
+        max_findings = {str(key): int(value) for key, value in max_findings_raw.items()}
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("Sanitizer configuration could not be read") from exc
     settings.ner = NerSettings(
         enabled=bool(ner_raw.get("enabled", False)),
         model_dir=str(ner_raw.get("model_dir", NerSettings.model_dir)),
         labels=ner_labels or DEFAULT_NER_LABELS,
         threshold=float(ner_raw.get("threshold", NerSettings.threshold)),
-        max_findings=int(ner_raw.get("max_findings", NerSettings.max_findings)),
+        max_findings=max_findings,
     )
-    if not 0.05 <= settings.ner.threshold <= 1.0 or not 1 <= settings.ner.max_findings <= 10000:
+    if (
+        not 0.05 <= settings.ner.threshold <= 1.0
+        or not all(1 <= cap <= 10000 for cap in settings.ner.max_findings.values())
+    ):
         raise SystemExit("Configured NER review settings are outside the supported range")
     limits_raw = raw.get("resource_limits", {})
     if not isinstance(limits_raw, dict):
@@ -1228,6 +1261,31 @@ def load_project_metadata(path: Path) -> set[str]:
     if not terms:
         raise SystemExit("The project metadata file yielded no usable identifiers")
     return terms
+
+
+def _blank_field_value(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, list):
+        return not any(isinstance(entry, str) and entry.strip() for entry in value)
+    return False
+
+
+def intake_empty_fields(path: Path | None) -> list[str]:
+    """`PROJECT_METADATA_FIELDS` entries missing or blank in the supplied
+    project-metadata file — the intake-completeness gate's audit trail. No
+    file at all counts every field as empty."""
+    if path is None:
+        return list(PROJECT_METADATA_FIELDS)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("The project metadata file is missing or invalid") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit("The project metadata file must contain an object")
+    return [name for name in PROJECT_METADATA_FIELDS if _blank_field_value(payload.get(name))]
 
 
 def derive_term_candidates(
@@ -2075,13 +2133,15 @@ class NerDetector:
         labels: Sequence[str],
         threshold: float,
         model_name: str,
-        max_findings: int = 500,
+        max_findings: Mapping[str, int] | None = None,
     ):
         self.predict = predict
         self.labels = tuple(labels)
         self.threshold = float(threshold)
         self.model_name = model_name
-        self.max_findings = int(max_findings)
+        self.max_findings: dict[str, int] = (
+            dict(max_findings) if max_findings else {"_default": DEFAULT_MAX_FINDINGS}
+        )
 
     def block_findings(self, blocks: Sequence[TextBlock]) -> Iterator[tuple[TextBlock, int, int, str, float]]:
         """Yield (block, start, end, label, score) with offsets into the
@@ -2456,6 +2516,7 @@ def verify_output(
     ner_suppressed: collections.Counter[str] = collections.Counter()
     ner_forms: dict[tuple[str, str], dict] = {}
     ner_forms_truncated: set[tuple[str, str]] = set()
+    ner_forms_by_label: collections.Counter[str] = collections.Counter()
     zone: str | None = None
     size_mismatch_pages: list[int] = []
     blank_render_pages: list[int] = []
@@ -2539,9 +2600,10 @@ def verify_output(
                 form_key = (label, re.sub(r"\s+", " ", text).strip().casefold())
                 record = ner_forms.get(form_key)
                 if record is None:
-                    if len(ner_forms) >= ner_detector.max_findings:
+                    if ner_forms_by_label[label] >= ner_cap_for_label(ner_detector.max_findings, label):
                         ner_forms_truncated.add(form_key)
                         continue
+                    ner_forms_by_label[label] += 1
                     label_slug = re.sub(r"[^a-z0-9]+", "_", label.casefold()).strip("_") or "entity"
                     record = {
                         "label": label,
@@ -2978,16 +3040,41 @@ def inputs_from_args(values: Sequence[str]) -> Iterator[Path]:
             yield path
 
 
-def build_run_payload(reports: list[dict], fingerprint: dict, ner_enabled: bool) -> dict:
+def truncation_incompleteness_reasons(reports: list[dict]) -> list[str]:
+    """One reason per document whose residual or NER review list was
+    truncated — the same incompleteness signal as an unfinished review,
+    per CONTEXT.md."""
+    reasons = []
+    for report in reports:
+        document_id = report.get("document_id", "unknown document")
+        if report.get("residuals_truncated"):
+            reasons.append(f"{document_id}: residual findings truncated")
+        ner_review = report.get("ner_review") or {}
+        if ner_review.get("findings_truncated"):
+            reasons.append(f"{document_id}: NER review findings truncated")
+    return reasons
+
+
+def build_run_payload(
+    reports: list[dict], fingerprint: dict, ner_enabled: bool,
+    intake_status: dict | None = None,
+) -> dict:
     all_automated_checks_pass = all(
         report["release_status"] == RELEASE_STATUS_AUTOMATED_PASS for report in reports
     )
+    incompleteness_reasons = truncation_incompleteness_reasons(reports)
+    if intake_status is not None and intake_status["empty_fields"] and not intake_status["waiver"]:
+        incompleteness_reasons.append(
+            "project intake metadata missing or incomplete: "
+            + ", ".join(intake_status["empty_fields"])
+        )
     payload = {
         "schema_version": 4,
         "documents": reports,
         "all_automated_checks_pass": all_automated_checks_pass,
         "release_status": derive_release_status(
             RELEASE_STATUS_AUTOMATED_PASS if all_automated_checks_pass else RELEASE_STATUS_FAIL,
+            incompleteness_reasons=incompleteness_reasons,
         ),
         "fingerprint": fingerprint,
         "notes": [
@@ -3000,6 +3087,10 @@ def build_run_payload(reports: list[dict], fingerprint: dict, ner_enabled: bool)
     if ner_enabled:
         payload["notes"].append(
             "NER review findings are report-only candidates for human triage; they never change automated checks."
+        )
+    if incompleteness_reasons:
+        payload["notes"].append(
+            "This run cannot reach RELEASED until resolved: " + "; ".join(incompleteness_reasons)
         )
     return payload
 
@@ -3082,7 +3173,7 @@ def manifest_document(report: dict, run_dir: Path) -> dict:
 
 def build_manifest(
     *, run_id: str, started_at: str, completed_at: str, payload: dict,
-    fingerprint: dict, versions: dict, run_dir: Path,
+    fingerprint: dict, versions: dict, run_dir: Path, intake_status: dict,
 ) -> dict:
     documents = [manifest_document(report, run_dir) for report in payload["documents"]]
     return {
@@ -3114,6 +3205,7 @@ def build_manifest(
             "reviewer": None,
             "completed_at": None,
         },
+        "intake": intake_status,
     }
 
 
@@ -3144,6 +3236,7 @@ def orchestrate_run(
     denylist_path: Path | None, project_metadata_path: Path | None,
     config_path: Path, allowlist_path: Path | None, lexicon_dir: Path,
     lexicons: Lexicons | None, ner_detector: NerDetector | None,
+    intake_waiver: str | None = None,
     script_path: Path = Path(__file__), repo_root: Path | None = None,
 ) -> tuple[Path, dict]:
     """Build a complete run in a private temp directory, then publish once.
@@ -3202,12 +3295,20 @@ def orchestrate_run(
             "release_status": RELEASE_STATUS_FAIL,
             "fail_reason": reason,
         })
-    payload = build_run_payload(reports, fingerprint, ner_detector is not None)
+    intake_status = {
+        "project_metadata_supplied": project_metadata_path is not None,
+        "empty_fields": intake_empty_fields(project_metadata_path),
+        "waiver": intake_waiver,
+    }
+    payload = build_run_payload(
+        reports, fingerprint, ner_detector is not None, intake_status=intake_status,
+    )
     completed_at = utc_timestamp()
     versions = runtime_versions(settings, ner_detector)
     manifest = build_manifest(
         run_id=run_id, started_at=started_at, completed_at=completed_at,
         payload=payload, fingerprint=fingerprint, versions=versions, run_dir=staging_dir,
+        intake_status=intake_status,
     )
     write_private_text(staging_dir / "report.json", json.dumps(payload, indent=2) + "\n")
     write_private_text(staging_dir / "manifest.json", json.dumps(manifest, indent=2) + "\n")
@@ -3266,6 +3367,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--project-metadata", type=Path, default=None,
         help="project intake JSON (name, number, address, parties, personnel); the "
              "primary way to seed the denylist, merged with --denylist when both are given",
+    )
+    parser.add_argument(
+        "--intake-waiver", type=str, default=None,
+        help="explicit recorded reason bypassing the intake-completeness gate when "
+             "--project-metadata is missing or has empty fields; recorded verbatim in the manifest",
     )
     parser.add_argument("--lexicons", type=Path, default=Path(DEFAULT_LEXICON_DIR))
     parser.add_argument("--allowlist", type=Path, default=Path(DEFAULT_ALLOWLIST))
@@ -3338,6 +3444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         lexicon_dir=args.lexicons,
         lexicons=lexicons,
         ner_detector=ner_detector,
+        intake_waiver=args.intake_waiver,
     )
     print(json.dumps({
         "run_directory": str(run_dir),

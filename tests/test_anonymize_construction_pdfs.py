@@ -425,6 +425,19 @@ class SanitizerTests(unittest.TestCase):
         self.assertEqual(sanitizer.derive_release_status(AP, {}), RR)
         self.assertEqual(sanitizer.derive_release_status(AP, {"status": "incomplete"}), RI)
         self.assertEqual(sanitizer.derive_release_status(AP, {"status": "complete"}), R)
+        # A truncated residual/NER review list (or an unresolved intake gate)
+        # is the same kind of incompleteness signal as an unfinished review:
+        # it blocks RELEASED even once a human has signed off as "complete".
+        self.assertEqual(
+            sanitizer.derive_release_status(AP, {"status": "complete"}, incompleteness_reasons=["x"]), RI,
+        )
+        # Irrelevant when the run would not have reached RELEASED anyway.
+        self.assertEqual(
+            sanitizer.derive_release_status(AP, incompleteness_reasons=["x"]), RR,
+        )
+        self.assertEqual(
+            sanitizer.derive_release_status(F, {"status": "complete"}, incompleteness_reasons=["x"]), F,
+        )
 
     def test_denylist_matches_terms_wrapped_across_lines(self) -> None:
         matcher = sanitizer.DenylistMatcher({"Fictional Owner Holdings"})
@@ -787,7 +800,7 @@ class SanitizerTests(unittest.TestCase):
 
         detector = sanitizer.NerDetector(
             overlapping_predict, ("company name", "organization"), 0.5, "stub-model",
-            max_findings=1,
+            max_findings={"_default": 1},
         )
         result = sanitizer.verify_output(
             source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(),
@@ -811,6 +824,66 @@ class SanitizerTests(unittest.TestCase):
             self.root / "triage" / "sanitized_document_01", os.urandom(32),
         )
         self.assertNotIn("ner_review", without)
+
+    @staticmethod
+    def stub_multi_ner_predict(targets_by_label: dict[str, list[str]]):
+        def predict(texts, labels, threshold):
+            results = []
+            for text in texts:
+                entities = []
+                for label, targets in targets_by_label.items():
+                    if label not in labels:
+                        continue
+                    for target in targets:
+                        cursor = 0
+                        while (found := text.find(target, cursor)) >= 0:
+                            entities.append({
+                                "start": found, "end": found + len(target),
+                                "label": label, "score": 0.9,
+                            })
+                            cursor = found + 1
+                results.append(entities)
+            return results
+        return predict
+
+    def test_per_label_cap_does_not_crowd_out_a_low_volume_label(self) -> None:
+        source = self.root / "many_firms.pdf"
+        pdf = canvas.Canvas(str(source), pagesize=letter)
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(45, 700, "Coordinate with Fictitious Firm Alpha on rough-in")
+        pdf.drawString(45, 680, "Coordinate with Fictitious Firm Beta on rough-in")
+        pdf.drawString(45, 660, "Coordinate with Fictitious Firm Gamma on rough-in")
+        pdf.drawString(45, 640, "Site access via 742 Evergreen Terrace Fictional Lane")
+        pdf.showPage()
+        pdf.save()
+        doc = fitz.open(source)
+        sizes = [(round(page.rect.width, 3), round(page.rect.height, 3)) for page in doc]
+        doc.close()
+
+        predict = self.stub_multi_ner_predict({
+            "organization": [
+                "Fictitious Firm Alpha", "Fictitious Firm Beta", "Fictitious Firm Gamma",
+            ],
+            "street address": ["742 Evergreen Terrace Fictional Lane"],
+        })
+        detector = sanitizer.NerDetector(
+            predict, ("organization", "street address"), 0.5, "stub-model",
+            # A single shared budget would let the three organization forms
+            # exhaust it before the one street address is ever seen.
+            max_findings={"_default": 1, "street address": 10},
+        )
+        result = sanitizer.verify_output(
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(),
+            self.root / "triage" / "sanitized_document_02", os.urandom(32), ner_detector=detector,
+        )
+        review = result["ner_review"]
+        # Only one of the three organization forms fits under its cap of 1...
+        self.assertEqual(review["distinct_form_counts"].get("organization"), 1)
+        # ...but the low-volume street address is never crowded out by it.
+        self.assertEqual(review["distinct_form_counts"].get("street address"), 1)
+        labels_seen = {finding["label"] for finding in review["findings"]}
+        self.assertIn("street address", labels_seen)
+        self.assertEqual(review["findings_truncated"], 2)
 
     def test_findings_tie_break_order_is_stable_across_runs(self) -> None:
         # Two distinct findings tied on occurrences and label. The sort's
@@ -987,6 +1060,30 @@ class DenylistSeedingTest(unittest.TestCase):
             sanitizer.load_project_metadata(empty)
         with self.assertRaises(SystemExit):
             sanitizer.load_project_metadata(self.root / "absent.json")
+
+    def test_intake_empty_fields_none_path_is_every_field(self) -> None:
+        self.assertEqual(
+            sanitizer.intake_empty_fields(None), list(sanitizer.PROJECT_METADATA_FIELDS),
+        )
+
+    def test_intake_empty_fields_reports_exactly_the_blank_ones(self) -> None:
+        path = self.root / "partial.json"
+        path.write_text(json.dumps({
+            "project_name": "Example Confidential Project",
+            "project_number": "",
+            "project_address": None,
+            "owner": [],
+            "architect": ["   "],
+            "personnel": ["Jane Doe"],
+        }), encoding="utf-8")
+        empty = sanitizer.intake_empty_fields(path)
+        self.assertEqual(sorted(empty), sorted([
+            "project_number", "project_address", "site_address", "owner",
+            "architect", "engineers", "contractors", "consultants",
+            "other_identifiers",
+        ]))
+        self.assertNotIn("project_name", empty)
+        self.assertNotIn("personnel", empty)
 
     def test_proposals_are_filtered_and_never_written_as_a_denylist(self) -> None:
         source = self.root / "source.pdf"
@@ -1464,6 +1561,57 @@ class BuildRunPayloadTest(unittest.TestCase):
         payload = sanitizer.build_run_payload(reports, self.FAKE_FINGERPRINT, ner_enabled=True)
         self.assertTrue(any("NER" in note for note in payload["notes"]))
 
+    def test_truncated_residuals_add_an_incompleteness_note(self) -> None:
+        reports = [{
+            "document_id": "sanitized_document_01",
+            "release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS,
+            "residuals_truncated": 1,
+        }]
+        payload = sanitizer.build_run_payload(reports, self.FAKE_FINGERPRINT, ner_enabled=False)
+        # Still an internal AUTOMATED_PASS/REVIEW_REQUIRED outcome today (no
+        # code path here ever supplies a completed review), but the report
+        # must already say why this run could never become RELEASED as-is.
+        self.assertEqual(payload["release_status"], sanitizer.RELEASE_STATUS_REVIEW_REQUIRED)
+        self.assertTrue(any("truncat" in note.casefold() for note in payload["notes"]))
+
+    def test_truncated_ner_findings_add_an_incompleteness_note(self) -> None:
+        reports = [{
+            "document_id": "sanitized_document_01",
+            "release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS,
+            "ner_review": {"findings_truncated": 2},
+        }]
+        payload = sanitizer.build_run_payload(reports, self.FAKE_FINGERPRINT, ner_enabled=True)
+        self.assertTrue(any("truncat" in note.casefold() for note in payload["notes"]))
+
+    def test_incomplete_intake_without_waiver_adds_a_note(self) -> None:
+        reports = [{"document_id": "sanitized_document_01", "release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS}]
+        payload = sanitizer.build_run_payload(
+            reports, self.FAKE_FINGERPRINT, ner_enabled=False,
+            intake_status={"project_metadata_supplied": False, "empty_fields": ["owner"], "waiver": None},
+        )
+        self.assertTrue(any("intake" in note.casefold() for note in payload["notes"]))
+
+    def test_incomplete_intake_with_waiver_adds_no_note(self) -> None:
+        reports = [{"document_id": "sanitized_document_01", "release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS}]
+        payload = sanitizer.build_run_payload(
+            reports, self.FAKE_FINGERPRINT, ner_enabled=False,
+            intake_status={
+                "project_metadata_supplied": False, "empty_fields": ["owner"],
+                "waiver": "no PM system record for this small project",
+            },
+        )
+        self.assertFalse(any("intake" in note.casefold() for note in payload["notes"]))
+
+    def test_no_truncation_adds_no_incompleteness_note(self) -> None:
+        reports = [{
+            "document_id": "sanitized_document_01",
+            "release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS,
+            "residuals_truncated": 0,
+            "ner_review": {"findings_truncated": 0},
+        }]
+        payload = sanitizer.build_run_payload(reports, self.FAKE_FINGERPRINT, ner_enabled=True)
+        self.assertFalse(any("truncat" in note.casefold() for note in payload["notes"]))
+
 
 class FingerprintCliWiringTest(unittest.TestCase):
     """main() actually computes and writes the fingerprint (catches a wrong
@@ -1890,6 +2038,57 @@ class AtomicRunPackagingTest(unittest.TestCase):
         self.assertEqual(payload["release_status"], sanitizer.RELEASE_STATUS_FAIL)
         self.assertEqual(payload["documents"][0]["release_status"], sanitizer.RELEASE_STATUS_FAIL)
         self.assertFalse(payload["documents"][0]["checks"]["processing_completed"])
+
+    def test_manifest_records_full_empty_field_list_with_no_project_metadata(self) -> None:
+        with (
+            mock.patch.object(sanitizer, "sanitize_document", side_effect=self.fake_sanitize),
+            mock.patch.object(sanitizer, "runtime_versions", return_value={"python": "test"}),
+        ):
+            run_dir, _ = sanitizer.orchestrate_run(
+                sources=[self.source], output_root=self.output_root, output_index_start=1,
+                denylist={"Fictional Owner Holdings"}, settings=sanitizer.Settings(),
+                temp_root=self.temp_root, denylist_path=self.denylist,
+                project_metadata_path=None, config_path=self.config,
+                allowlist_path=self.allowlist, lexicon_dir=self.lexicons,
+                lexicons=None, ner_detector=None, intake_waiver="no PM record for this pilot run",
+            )
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        self.assertEqual(manifest["intake"], {
+            "project_metadata_supplied": False,
+            "empty_fields": list(sanitizer.PROJECT_METADATA_FIELDS),
+            "waiver": "no PM record for this pilot run",
+        })
+
+    def test_manifest_records_exactly_the_blank_project_metadata_fields(self) -> None:
+        project_metadata = self.root / "project.json"
+        project_metadata.write_text(json.dumps({
+            "project_name": "Example Confidential Project",
+            "project_number": "ZX-FAKE-2048",
+        }))
+        with (
+            mock.patch.object(sanitizer, "sanitize_document", side_effect=self.fake_sanitize),
+            mock.patch.object(sanitizer, "runtime_versions", return_value={"python": "test"}),
+        ):
+            run_dir, _ = sanitizer.orchestrate_run(
+                sources=[self.source], output_root=self.output_root, output_index_start=1,
+                denylist={"Fictional Owner Holdings"}, settings=sanitizer.Settings(),
+                temp_root=self.temp_root, denylist_path=self.denylist,
+                project_metadata_path=project_metadata, config_path=self.config,
+                allowlist_path=self.allowlist, lexicon_dir=self.lexicons,
+                lexicons=None, ner_detector=None,
+            )
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        self.assertTrue(manifest["intake"]["project_metadata_supplied"])
+        self.assertIsNone(manifest["intake"]["waiver"])
+        self.assertEqual(sorted(manifest["intake"]["empty_fields"]), sorted([
+            field for field in sanitizer.PROJECT_METADATA_FIELDS
+            if field not in ("project_name", "project_number")
+        ]))
+        # The hash of the supplied project-metadata file is always recorded.
+        self.assertEqual(
+            manifest["fingerprint"]["project_metadata_sha256"],
+            hashlib.sha256(project_metadata.read_bytes()).hexdigest(),
+        )
 
 
 class RenderedPageOcrVerifierTest(unittest.TestCase):
