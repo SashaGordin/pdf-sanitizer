@@ -27,6 +27,13 @@
       "_default": 500
     }
   },
+  "resource_limits": {
+    "max_memory_bytes": 4294967296,
+    "max_cpu_seconds": 3600,
+    "max_staging_disk_bytes": 8589934592,
+    "resource_check_every_pages": 25,
+    "retention_days": 30
+  },
   "regions": [
     {
       "name": "example-cover-approval-area",
