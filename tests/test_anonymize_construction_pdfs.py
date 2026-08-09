@@ -12,6 +12,10 @@ from pathlib import Path
 from unittest import mock
 
 import subprocess
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import fitz
 from PIL import Image
@@ -36,6 +40,13 @@ verify_existing = importlib.util.module_from_spec(VERIFY_SPEC)
 assert VERIFY_SPEC and VERIFY_SPEC.loader
 sys.modules[VERIFY_SPEC.name] = verify_existing
 VERIFY_SPEC.loader.exec_module(verify_existing)
+
+REVIEWER_MODULE_PATH = Path(__file__).parents[1] / "tools" / "reviewer_triage.py"
+REVIEWER_SPEC = importlib.util.spec_from_file_location("reviewer_triage", REVIEWER_MODULE_PATH)
+reviewer_triage = importlib.util.module_from_spec(REVIEWER_SPEC)
+assert REVIEWER_SPEC and REVIEWER_SPEC.loader
+sys.modules[REVIEWER_SPEC.name] = reviewer_triage
+REVIEWER_SPEC.loader.exec_module(reviewer_triage)
 
 
 FAKE_TERMS = {
@@ -2012,6 +2023,343 @@ class VerifyExistingTest(unittest.TestCase):
             verify_existing.IndependentLine("QUANTITY VOLTAGE", 105, 100, 250, 112),
         ]
         self.assertEqual(policy.scan_lines(lines), {})
+
+
+class ReviewerTriageTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="reviewer_triage_test_")
+        self.addCleanup(self.tmp.cleanup)
+        self.run_dir = Path(self.tmp.name)
+        self.decisions_path = self.run_dir / "decisions.json"
+
+        self.doc1_crop = self.run_dir / "triage" / "sanitized_document_01" / "residual_0001_page0003_denylist.png"
+        self.doc1_ner_crop = self.run_dir / "triage" / "sanitized_document_01" / "ner" / "ner_0001_page0001_person_name.png"
+        self.doc2_crop = self.run_dir / "triage" / "sanitized_document_02" / "residual_0001_page0001_street_address.png"
+        for crop in (self.doc1_crop, self.doc1_ner_crop, self.doc2_crop):
+            crop.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (4, 4), (255, 255, 255)).save(crop)
+
+        self.report = {
+            "documents": [
+                {
+                    "document_id": "sanitized_document_01",
+                    "residuals": [
+                        {
+                            "page": 3,
+                            "category": "denylist",
+                            "shape": "Aaaaa Aaaaa Aaaaaaaaaaa LLC",
+                            "crop": str(self.doc1_crop.relative_to(self.run_dir)),
+                        },
+                    ],
+                    "ner_review": {
+                        "findings": [
+                            {
+                                "label": "person name",
+                                "shape": "Aaaa A. Aaaaaaa",
+                                "occurrences": 7,
+                                "pages": [1, 4, 9],
+                                "score_max": 0.91,
+                                "zone": "title_block",
+                                "evidence": [],
+                                "crop": str(self.doc1_ner_crop.relative_to(self.run_dir)),
+                            },
+                        ],
+                        "findings_truncated": 0,
+                    },
+                },
+                {
+                    "document_id": "sanitized_document_02",
+                    "residuals": [
+                        {
+                            "page": 1,
+                            "category": "street_address",
+                            "shape": "999 Aaaaa Aa, Aaaaaaa, XX 99999",
+                            "crop": str(self.doc2_crop.relative_to(self.run_dir)),
+                        },
+                    ],
+                    "ner_review": {"findings": [], "findings_truncated": 0},
+                },
+            ],
+        }
+        (self.run_dir / "report.json").write_text(json.dumps(self.report))
+
+        self.output_sha_1 = hashlib.sha256(b"doc1").hexdigest()
+        self.output_sha_2 = hashlib.sha256(b"doc2").hexdigest()
+        self.manifest = {
+            "run_id": "test-run",
+            "documents": [
+                {
+                    "document_id": "sanitized_document_01",
+                    "output": {"path": "sanitized_document_01.pdf", "sha256": self.output_sha_1},
+                },
+                {
+                    "document_id": "sanitized_document_02",
+                    "output": {"path": "sanitized_document_02.pdf", "sha256": self.output_sha_2},
+                },
+            ],
+        }
+        (self.run_dir / "manifest.json").write_text(json.dumps(self.manifest))
+
+        self.findings = reviewer_triage.load_findings(self.report)
+        self.residual_finding_id = "sanitized_document_01:residual:3:denylist"
+        self.ner_finding_id = "sanitized_document_01:ner:person name:Aaaa A. Aaaaaaa"
+        self.doc2_finding_id = "sanitized_document_02:residual:1:street_address"
+
+    def test_load_findings_flattens_real_report_shape(self) -> None:
+        ids = {finding["id"] for finding in self.findings}
+        self.assertEqual(
+            ids, {self.residual_finding_id, self.ner_finding_id, self.doc2_finding_id},
+        )
+        residual = next(f for f in self.findings if f["id"] == self.residual_finding_id)
+        self.assertEqual(residual["document_id"], "sanitized_document_01")
+        self.assertEqual(residual["category"], "denylist")
+        self.assertEqual(residual["pages"], [3])
+        self.assertEqual(residual["crop"], str(self.doc1_crop.relative_to(self.run_dir)))
+        ner = next(f for f in self.findings if f["id"] == self.ner_finding_id)
+        self.assertEqual(ner["category"], "person name")
+        self.assertEqual(ner["occurrences"], 7)
+        self.assertEqual(ner["pages"], [1, 4, 9])
+
+    def test_reviewer_payload_hides_internal_fields(self) -> None:
+        payload = reviewer_triage.build_reviewer_payload(self.findings, {}, run_dir=self.run_dir)
+        banned_keys = {"category", "label", "shape", "occurrences", "score_max", "evidence", "zone", "source"}
+        allowed_keys = {"id", "plain_guess", "pages", "crop_url", "disposition", "note"}
+        for item in payload:
+            self.assertFalse(banned_keys & item.keys(), item)
+            self.assertTrue(set(item.keys()) <= allowed_keys, item)
+
+    def test_load_report_raises_when_manifest_is_missing(self) -> None:
+        empty_dir = self.run_dir / "no_manifest_here"
+        empty_dir.mkdir()
+        (empty_dir / "report.json").write_text(json.dumps({"documents": []}))
+        with self.assertRaises(ValueError):
+            reviewer_triage.load_report(empty_dir)
+
+    def test_plain_guess_covers_every_real_category_and_ner_label(self) -> None:
+        real_categories = set(sanitizer.DIRECT_PATTERNS.keys()) | {"denylist", "labelled_identifier"}
+        real_ner_labels = set(sanitizer.DEFAULT_NER_LABELS)
+        missing = (real_categories | real_ner_labels) - reviewer_triage.PLAIN_GUESS.keys()
+        self.assertEqual(missing, set(), f"no plain-language guess for: {missing}")
+
+    def test_reviewer_payload_gives_plain_language_guesses(self) -> None:
+        payload = reviewer_triage.build_reviewer_payload(self.findings, {}, run_dir=self.run_dir)
+        by_id = {item["id"]: item for item in payload}
+        self.assertEqual(
+            by_id[self.residual_finding_id]["plain_guess"],
+            reviewer_triage.PLAIN_GUESS["denylist"],
+        )
+        self.assertEqual(
+            by_id[self.ner_finding_id]["plain_guess"],
+            reviewer_triage.PLAIN_GUESS["person name"],
+        )
+
+    def test_reviewer_payload_crop_url_and_missing_crop_fallback(self) -> None:
+        payload = reviewer_triage.build_reviewer_payload(self.findings, {}, run_dir=self.run_dir)
+        by_id = {item["id"]: item for item in payload}
+        self.assertEqual(by_id[self.residual_finding_id]["crop_url"], f"/crops?id={self.residual_finding_id}")
+        self.doc1_crop.unlink()
+        payload = reviewer_triage.build_reviewer_payload(self.findings, {}, run_dir=self.run_dir)
+        by_id = {item["id"]: item for item in payload}
+        self.assertIsNone(by_id[self.residual_finding_id]["crop_url"])
+
+    def test_reviewer_payload_reflects_existing_decisions(self) -> None:
+        decisions = {
+            self.residual_finding_id: {"disposition": "safe", "note": "looks fine"},
+        }
+        payload = reviewer_triage.build_reviewer_payload(self.findings, decisions, run_dir=self.run_dir)
+        by_id = {item["id"]: item for item in payload}
+        self.assertEqual(by_id[self.residual_finding_id]["disposition"], "safe")
+        self.assertEqual(by_id[self.residual_finding_id]["note"], "looks fine")
+        self.assertNotIn("disposition", by_id[self.ner_finding_id])
+
+    def test_record_disposition_writes_entry_keyed_to_output_hash(self) -> None:
+        entry = reviewer_triage.record_disposition(
+            self.residual_finding_id, "duplicate", "already in denylist", self.decisions_path,
+        )
+        self.assertEqual(entry["document_id"], "sanitized_document_01")
+        self.assertEqual(entry["output_sha256"], self.output_sha_1)
+        self.assertEqual(entry["disposition"], "duplicate")
+        self.assertEqual(entry["note"], "already in denylist")
+        self.assertIn("decided_at", entry)
+
+        on_disk = json.loads(self.decisions_path.read_text())
+        self.assertEqual(on_disk["run_id"], "test-run")
+        self.assertEqual(on_disk["decisions"][self.residual_finding_id], entry)
+
+    def test_record_disposition_upserts_same_finding(self) -> None:
+        reviewer_triage.record_disposition(
+            self.residual_finding_id, "duplicate", "first note", self.decisions_path,
+        )
+        second = reviewer_triage.record_disposition(
+            self.residual_finding_id, "sensitive", "changed my mind", self.decisions_path,
+        )
+        on_disk = json.loads(self.decisions_path.read_text())
+        self.assertEqual(len(on_disk["decisions"]), 1)
+        self.assertEqual(on_disk["decisions"][self.residual_finding_id]["disposition"], "sensitive")
+        self.assertEqual(second["note"], "changed my mind")
+
+    def test_record_disposition_rejects_unknown_disposition(self) -> None:
+        with self.assertRaises(ValueError):
+            reviewer_triage.record_disposition(
+                self.residual_finding_id, "not_a_real_disposition", "", self.decisions_path,
+            )
+
+    def test_record_disposition_rejects_unresolvable_document(self) -> None:
+        with self.assertRaises(ValueError):
+            reviewer_triage.record_disposition(
+                "nonexistent_document:residual:1:denylist", "safe", "", self.decisions_path,
+            )
+
+    def test_record_disposition_keys_each_entry_to_its_own_document(self) -> None:
+        reviewer_triage.record_disposition(self.residual_finding_id, "safe", "", self.decisions_path)
+        entry2 = reviewer_triage.record_disposition(self.doc2_finding_id, "escalate", "", self.decisions_path)
+        self.assertEqual(entry2["output_sha256"], self.output_sha_2)
+        self.assertNotEqual(entry2["output_sha256"], self.output_sha_1)
+
+    def test_promotion_preview_duplicate_and_safe_only(self) -> None:
+        findings_by_id = {finding["id"]: finding for finding in self.findings}
+        decisions = {
+            self.residual_finding_id: {"disposition": "duplicate", "note": ""},
+            self.ner_finding_id: {"disposition": "safe", "note": ""},
+            self.doc2_finding_id: {"disposition": "sensitive", "note": ""},
+        }
+        preview = reviewer_triage.build_promotion_preview(findings_by_id, decisions)
+        self.assertEqual(len(preview["denylist_additions"]), 1)
+        self.assertEqual(preview["denylist_additions"][0]["shape"], "Aaaaa Aaaaa Aaaaaaaaaaa LLC")
+        self.assertEqual(len(preview["lexicon_proposals"]), 1)
+        self.assertEqual(preview["lexicon_proposals"][0]["shape"], "Aaaa A. Aaaaaaa")
+
+    def test_promotion_preview_escalate_and_sensitive_produce_nothing(self) -> None:
+        findings_by_id = {finding["id"]: finding for finding in self.findings}
+        decisions = {
+            self.residual_finding_id: {"disposition": "sensitive", "note": ""},
+            self.ner_finding_id: {"disposition": "escalate", "note": ""},
+        }
+        preview = reviewer_triage.build_promotion_preview(findings_by_id, decisions)
+        self.assertEqual(preview["denylist_additions"], [])
+        self.assertEqual(preview["lexicon_proposals"], [])
+
+    def test_reviewer_payload_never_contains_promotion_preview_data(self) -> None:
+        findings_by_id = {finding["id"]: finding for finding in self.findings}
+        decisions = {
+            self.residual_finding_id: {"disposition": "duplicate", "note": ""},
+            self.ner_finding_id: {"disposition": "safe", "note": ""},
+        }
+        preview = reviewer_triage.build_promotion_preview(findings_by_id, decisions)
+        preview_keys = set(preview.keys())
+        payload = reviewer_triage.build_reviewer_payload(self.findings, decisions, run_dir=self.run_dir)
+        for item in payload:
+            self.assertFalse(preview_keys & item.keys())
+
+    def start_server(self):
+        findings_by_id = {finding["id"]: finding for finding in self.findings}
+        server = reviewer_triage.make_server(
+            "127.0.0.1", 0, run_dir=self.run_dir, findings_by_id=findings_by_id,
+            decisions_path=self.decisions_path,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        # addCleanup runs LIFO: register in reverse of the order they must
+        # run (shutdown the serve_forever loop, then join the thread it was
+        # running in, then close the socket) or thread.join() hangs forever
+        # waiting for a thread nothing ever told to stop.
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def test_server_get_findings_and_post_decision_round_trip(self) -> None:
+        server = self.start_server()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+
+        with urllib.request.urlopen(f"{base}/api/findings") as response:
+            findings_response = json.loads(response.read())
+        ids = {item["id"] for item in findings_response}
+        self.assertIn(self.residual_finding_id, ids)
+
+        body = json.dumps({
+            "finding_id": self.residual_finding_id, "disposition": "duplicate", "note": "seen before",
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"{base}/api/decisions", data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.status, 200)
+            written = json.loads(response.read())
+        self.assertEqual(written["disposition"], "duplicate")
+        self.assertEqual(written["output_sha256"], self.output_sha_1)
+
+        on_disk = json.loads(self.decisions_path.read_text())
+        self.assertEqual(on_disk["decisions"][self.residual_finding_id]["note"], "seen before")
+
+    def test_server_post_unknown_finding_id_is_404(self) -> None:
+        server = self.start_server()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        body = json.dumps({
+            "finding_id": "no_such_finding", "disposition": "safe", "note": "",
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"{base}/api/decisions", data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(request)
+        self.addCleanup(ctx.exception.close)
+        self.assertEqual(ctx.exception.code, 404)
+
+    def test_server_post_bad_disposition_is_400(self) -> None:
+        server = self.start_server()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        body = json.dumps({
+            "finding_id": self.residual_finding_id, "disposition": "maybe", "note": "",
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"{base}/api/decisions", data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(request)
+        self.addCleanup(ctx.exception.close)
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_server_serves_crop_image(self) -> None:
+        server = self.start_server()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with urllib.request.urlopen(f"{base}/crops?id={urllib.parse.quote(self.residual_finding_id)}") as response:
+            self.assertEqual(response.headers["Content-Type"], "image/png")
+            self.assertEqual(response.read(), self.doc1_crop.read_bytes())
+
+    def test_server_ops_preview_never_reachable_from_reviewer_payload_endpoint(self) -> None:
+        server = self.start_server()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        reviewer_triage.record_disposition(self.residual_finding_id, "duplicate", "", self.decisions_path)
+        with urllib.request.urlopen(f"{base}/api/findings") as response:
+            findings_response = json.loads(response.read())
+        with urllib.request.urlopen(f"{base}/api/ops/preview") as response:
+            preview_response = json.loads(response.read())
+        self.assertEqual(len(preview_response["denylist_additions"]), 1)
+        preview_keys = set(preview_response.keys())
+        for item in findings_response:
+            self.assertFalse(preview_keys & item.keys())
+
+    def test_server_serves_reviewer_and_ops_html_pages(self) -> None:
+        server = self.start_server()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with urllib.request.urlopen(f"{base}/") as response:
+            self.assertIn(b"Review flagged items", response.read())
+        with urllib.request.urlopen(f"{base}/ops") as response:
+            self.assertIn(b"Promotion preview", response.read())
+
+    def test_reviewer_html_never_mentions_ops_or_promotion_terms(self) -> None:
+        source = reviewer_triage.REVIEWER_HTML.read_text().lower()
+        for banned in ("denylist", "lexicon", "/ops", "/api/ops"):
+            self.assertNotIn(banned, source)
+
+    def test_ops_html_has_no_disposition_controls(self) -> None:
+        source = reviewer_triage.OPS_HTML.read_text().lower()
+        for banned in ("sensitive", "fine to show", "already flagged", "ask someone else", "/api/decisions"):
+            self.assertNotIn(banned, source)
 
 
 if __name__ == "__main__":

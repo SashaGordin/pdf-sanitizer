@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Review flagged items</title>
+<style>
+  :root {
+    --sensitive: #b4232a;
+    --safe: #1f7a3f;
+    --duplicate: #8a5a00;
+    --escalate: #6b3fa0;
+    --ink: #1c1c1c;
+    --paper: #faf8f3;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    margin: 0; padding: 0;
+    background: #eee; color: var(--ink);
+  }
+  #app { max-width: 1000px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 20px; margin: 0 0 4px 0; }
+  .sub { color: #555; font-size: 14px; margin-bottom: 18px; }
+  .progress { font-size: 13px; color: #444; margin-bottom: 14px; }
+
+  .crop {
+    background: var(--paper);
+    border: 1px solid #d8d2c2;
+    border-radius: 4px;
+    padding: 10px;
+    width: 100%;
+    min-height: 90px;
+    text-align: center;
+  }
+  .crop img { max-width: 100%; display: block; margin: 0 auto; }
+  .crop .no-crop { color: #888; font-size: 13px; padding: 30px 0; }
+  .crop-caption { font-size: 12px; color: #666; margin-bottom: 6px; }
+
+  .guess { font-size: 14px; margin: 12px 0; }
+
+  .disposition-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .disposition-btns button {
+    flex: 1; min-width: 140px; padding: 12px; border-radius: 6px; border: 2px solid;
+    font-size: 13px; font-weight: 600; cursor: pointer; background: #fff;
+  }
+  button.sensitive { border-color: var(--sensitive); color: var(--sensitive); }
+  button.safe { border-color: var(--safe); color: var(--safe); }
+  button.duplicate { border-color: var(--duplicate); color: var(--duplicate); }
+  button.escalate { border-color: var(--escalate); color: var(--escalate); }
+  button.sensitive.active { background: var(--sensitive); color: #fff; }
+  button.safe.active { background: var(--safe); color: #fff; }
+  button.duplicate.active { background: var(--duplicate); color: #fff; }
+  button.escalate.active { background: var(--escalate); color: #fff; }
+
+  .note-label { display: block; font-size: 12px; color: #555; margin-top: 14px; margin-bottom: 4px; }
+  textarea.note {
+    width: 100%; font-size: 13px; padding: 8px;
+    border: 1px solid #ccc; border-radius: 4px; font-family: inherit; resize: vertical;
+  }
+
+  .inbox { display: flex; gap: 16px; }
+  .inbox-list { width: 300px; border: 1px solid #ddd; border-radius: 6px; background: #fff; overflow: hidden; }
+  .inbox-row {
+    padding: 12px; border-bottom: 1px solid #eee; cursor: pointer; font-size: 14px;
+  }
+  .inbox-row:hover { background: #f5f5f5; }
+  .inbox-row.selected { background: #eef4ff; }
+  .inbox-row .tag {
+    display: block; margin-top: 4px; font-size: 12px; font-weight: 600;
+  }
+  .inbox-detail { flex: 1; background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 18px; }
+
+  .all-done {
+    margin-top: 16px; padding: 14px; background: #eaf7ee; border: 1px solid #bfe3c9;
+    border-radius: 6px; font-size: 14px; color: #1f7a3f;
+  }
+  .loading { color: #666; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="app"><div class="loading">Loading findings…</div></div>
+
+<script>
+"use strict";
+
+const DISPOSITIONS = [
+  { key: "sensitive", label: "Yes, this is sensitive" },
+  { key: "safe", label: "No, fine to show" },
+  { key: "duplicate", label: "We've already flagged this" },
+  { key: "escalate", label: "Not sure, ask someone else" },
+];
+
+const state = {
+  findings: [],
+  notes: {},   // finding id -> draft note text, seeded from the server
+  selected: null,
+};
+
+function decidedCount() {
+  return state.findings.filter(f => f.disposition).length;
+}
+
+function findingById(id) {
+  return state.findings.find(f => f.id === id);
+}
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+async function postDecision(findingId, disposition) {
+  const response = await fetch("/api/decisions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      finding_id: findingId,
+      disposition: disposition,
+      note: state.notes[findingId] || "",
+    }),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    alert("Could not save that: " + (body.error || response.statusText));
+    return;
+  }
+  const entry = await response.json();
+  const finding = findingById(findingId);
+  finding.disposition = entry.disposition;
+  finding.note = entry.note;
+  render();
+}
+
+function setDisposition(findingId, key) {
+  postDecision(findingId, key);
+}
+
+function setNote(findingId, text) {
+  state.notes[findingId] = text;
+}
+
+function saveNoteIfDecided(findingId) {
+  const finding = findingById(findingId);
+  if (finding.disposition) {
+    postDecision(findingId, finding.disposition);
+  }
+}
+
+function cropEl(finding) {
+  const div = document.createElement("div");
+  div.className = "crop";
+  if (finding.crop_url) {
+    const img = document.createElement("img");
+    img.src = finding.crop_url;
+    img.alt = "Crop of the flagged region";
+    div.appendChild(img);
+  } else {
+    div.innerHTML = `<div class="no-crop">(no crop available for this item)</div>`;
+  }
+  return div;
+}
+
+function dispositionButtons(findingId, current) {
+  const wrap = document.createElement("div");
+  wrap.className = "disposition-btns";
+  DISPOSITIONS.forEach(({ key, label }) => {
+    const btn = document.createElement("button");
+    btn.className = key + (current === key ? " active" : "");
+    btn.textContent = label;
+    btn.onclick = () => setDisposition(findingId, key);
+    wrap.appendChild(btn);
+  });
+  return wrap;
+}
+
+function render() {
+  const root = document.getElementById("app");
+  root.innerHTML = "";
+
+  const h = document.createElement("h1");
+  h.textContent = "Review flagged items";
+  const sub = document.createElement("div");
+  sub.className = "sub";
+  sub.textContent = "For each item below: should it stay hidden, or is it fine to show?";
+  root.appendChild(h);
+  root.appendChild(sub);
+
+  const progress = document.createElement("div");
+  progress.className = "progress";
+  progress.textContent = `${decidedCount()} of ${state.findings.length} reviewed`;
+  root.appendChild(progress);
+
+  const inbox = document.createElement("div");
+  inbox.className = "inbox";
+
+  const list = document.createElement("div");
+  list.className = "inbox-list";
+  state.findings.forEach(f => {
+    const row = document.createElement("div");
+    row.className = "inbox-row" + (f.id === state.selected ? " selected" : "");
+    const dispositionLabel = f.disposition ? DISPOSITIONS.find(d => d.key === f.disposition).label : null;
+    row.innerHTML = `Page ${f.pages[0]} -- ${escapeHtml(f.plain_guess)}` +
+      (dispositionLabel ? `<span class="tag" style="color:var(--${f.disposition})">${escapeHtml(dispositionLabel)}</span>` : "");
+    row.onclick = () => { state.selected = f.id; render(); };
+    list.appendChild(row);
+  });
+  inbox.appendChild(list);
+
+  const detail = document.createElement("div");
+  detail.className = "inbox-detail";
+  const finding = findingById(state.selected);
+  if (finding) {
+    const caption = document.createElement("div");
+    caption.className = "crop-caption";
+    caption.textContent = `This is what was found on page ${finding.pages[0]}:`;
+    detail.appendChild(caption);
+    detail.appendChild(cropEl(finding));
+
+    const guess = document.createElement("div");
+    guess.className = "guess";
+    guess.innerHTML = `Our best guess: <strong>${escapeHtml(finding.plain_guess)}</strong>.`;
+    detail.appendChild(guess);
+
+    detail.appendChild(dispositionButtons(finding.id, finding.disposition));
+
+    const noteLabel = document.createElement("label");
+    noteLabel.className = "note-label";
+    noteLabel.textContent = "Add a note for the team (optional):";
+    detail.appendChild(noteLabel);
+    const note = document.createElement("textarea");
+    note.className = "note";
+    note.rows = 2;
+    note.placeholder = "Anything that would help us understand your call...";
+    note.value = state.notes[finding.id] || "";
+    note.oninput = (e) => setNote(finding.id, e.target.value);
+    note.onblur = () => saveNoteIfDecided(finding.id);
+    detail.appendChild(note);
+  }
+  inbox.appendChild(detail);
+  root.appendChild(inbox);
+
+  if (state.findings.length && decidedCount() === state.findings.length) {
+    const done = document.createElement("div");
+    done.className = "all-done";
+    done.textContent = "You're done reviewing everything in this batch. Thanks!";
+    root.appendChild(done);
+  }
+}
+
+async function load() {
+  const response = await fetch("/api/findings");
+  state.findings = await response.json();
+  state.findings.forEach(f => { state.notes[f.id] = f.note || ""; });
+  state.selected = state.findings.length ? state.findings[0].id : null;
+  render();
+}
+
+load();
+</script>
+</body>
+</html>
