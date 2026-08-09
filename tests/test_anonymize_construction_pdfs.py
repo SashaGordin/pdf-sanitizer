@@ -2419,6 +2419,7 @@ class ResourceCeilingTest(unittest.TestCase):
             with self.assertRaises(sanitizer.PageProcessingError) as caught:
                 sanitizer.sanitize_document(
                     source, destination, "sanitized_document_01", FAKE_TERMS, settings, self.root,
+                    os.urandom(32),
                 )
         self.assertEqual(caught.exception.page_number, 1)
         self.assertIn("memory", caught.exception.reason.lower())
@@ -2447,7 +2448,7 @@ class ResourceCeilingTest(unittest.TestCase):
         temp_root.mkdir()
 
         def breaching_sanitize(source, destination, document_id, denylist, settings, temp_root,
-                                ner_detector=None, lexicons=None):
+                                run_key, ner_detector=None, lexicons=None):
             sanitizer.check_resource_ceilings(destination.parent, settings.resource_limits, 1)
             raise AssertionError("check_resource_ceilings should have raised")
 
@@ -2508,7 +2509,7 @@ class RunCleanupTest(unittest.TestCase):
     @staticmethod
     def fake_sanitize_with_triage(release_status: str):
         def fake_sanitize(source, destination, document_id, denylist, settings, temp_root,
-                           ner_detector=None, lexicons=None):
+                           run_key, ner_detector=None, lexicons=None):
             destination.write_bytes(b"synthetic sanitized pdf")
             triage_dir = destination.parent / "triage" / document_id
             triage_dir.mkdir(parents=True, exist_ok=True)
@@ -2546,7 +2547,7 @@ class RunCleanupTest(unittest.TestCase):
 
     def test_failed_run_leaves_triage_directory_untouched(self) -> None:
         def raising_sanitize(source, destination, document_id, denylist, settings, temp_root,
-                              ner_detector=None, lexicons=None):
+                              run_key, ner_detector=None, lexicons=None):
             triage_dir = destination.parent / "triage" / document_id
             triage_dir.mkdir(parents=True, exist_ok=True)
             (triage_dir / "residual_0001_page0001_street_address.png").write_bytes(b"crop")
@@ -2562,7 +2563,7 @@ class RunCleanupTest(unittest.TestCase):
         statuses = iter([sanitizer.RELEASE_STATUS_AUTOMATED_PASS, sanitizer.RELEASE_STATUS_FAIL])
 
         def mixed_sanitize(source, destination, document_id, denylist, settings, temp_root,
-                            ner_detector=None, lexicons=None):
+                            run_key, ner_detector=None, lexicons=None):
             destination.write_bytes(b"synthetic sanitized pdf")
             triage_dir = destination.parent / "triage" / document_id
             triage_dir.mkdir(parents=True, exist_ok=True)
