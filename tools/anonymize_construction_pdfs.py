@@ -12,6 +12,7 @@ import collections
 import csv
 import datetime as dt
 import hashlib
+import hmac
 import importlib.metadata
 import io
 import json
@@ -19,7 +20,9 @@ import os
 import platform
 import re
 import resource
+import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -27,7 +30,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Mapping, Sequence
 
 try:
     import fitz  # PyMuPDF
@@ -171,7 +174,11 @@ def automated_gate_status(checks: dict[str, bool]) -> str:
     return RELEASE_STATUS_AUTOMATED_PASS if all(checks.values()) else RELEASE_STATUS_FAIL
 
 
-def derive_release_status(automated_status: str, review: dict | None = None) -> str:
+def derive_release_status(
+    automated_status: str,
+    review: dict | None = None,
+    incompleteness_reasons: Sequence[str] = (),
+) -> str:
     """The outward release status for a run, folding automated results
     together with review state.
 
@@ -179,12 +186,18 @@ def derive_release_status(automated_status: str, review: dict | None = None) -> 
     the manifest's review fields (populated outside this tool — no reviewer
     UI is in scope). Its `status` key, once present, is "complete" or
     "incomplete".
+
+    `incompleteness_reasons`, when non-empty, blocks RELEASED the same way an
+    unfinished review does — e.g. a truncated residual/NER review list, or
+    an unresolved project-intake gate — even once review is "complete".
     """
     if automated_status != RELEASE_STATUS_AUTOMATED_PASS:
         return RELEASE_STATUS_FAIL
     if not review or not review.get("status"):
         return RELEASE_STATUS_REVIEW_REQUIRED
     if review["status"] != "complete":
+        return RELEASE_STATUS_REVIEW_INCOMPLETE
+    if incompleteness_reasons:
         return RELEASE_STATUS_REVIEW_INCOMPLETE
     return RELEASE_STATUS_RELEASED
 
@@ -226,7 +239,7 @@ class Detection:
     """One located candidate, with enough provenance to audit and measure it.
 
     `text` is the matched string. It stays in memory for suppression decisions
-    and is never serialized — the report carries masked shapes only.
+    and is never serialized — the report carries keyed digests only.
     """
 
     rect: fitz.Rect
@@ -716,6 +729,8 @@ DEFAULT_NER_LABELS: tuple[str, ...] = (
     "project name", "street address", "city",
 )
 
+DEFAULT_MAX_FINDINGS = 500
+
 
 @dataclass(frozen=True)
 class NerSettings:
@@ -726,7 +741,35 @@ class NerSettings:
     model_dir: str = "models/gliner_multi_pii-v1"
     labels: tuple[str, ...] = DEFAULT_NER_LABELS
     threshold: float = 0.5
-    max_findings: int = 500
+    # Per-label distinct-finding caps, keyed by label; "_default" applies to
+    # any label with no explicit entry. Keeps a high-volume label (e.g.
+    # "organization") from crowding out a low-volume, high-value one (e.g.
+    # "street address") under one shared budget.
+    max_findings: Mapping[str, int] = field(default_factory=lambda: {"_default": DEFAULT_MAX_FINDINGS})
+
+
+def ner_cap_for_label(caps: Mapping[str, int], label: str) -> int:
+    """The distinct-finding cap for `label`, falling back to the caps
+    mapping's own "_default" entry, or DEFAULT_MAX_FINDINGS if that too is
+    absent."""
+    return caps.get(label, caps.get("_default", DEFAULT_MAX_FINDINGS))
+
+
+@dataclass(frozen=True)
+class ResourceLimits:
+    """Process-wide ceilings for one CLI invocation (Phase 5 operational scope).
+
+    RLIMIT_AS/RLIMIT_CPU are process-wide, not per-document, because the whole
+    run's document batch shares one Python process (see orchestrate_run). The
+    disk ceiling has no OS-level rlimit equivalent for a directory, so it's
+    enforced by explicit polling instead.
+    """
+
+    max_memory_bytes: int = 4 * 1024**3
+    max_cpu_seconds: int = 3600
+    max_staging_disk_bytes: int = 8 * 1024**3
+    resource_check_every_pages: int = 25
+    retention_days: int = 30
 
 
 @dataclass
@@ -745,6 +788,7 @@ class Settings:
     repeated_image_min_pages: int = 3
     regions: list[Region] = field(default_factory=list)
     ner: NerSettings = field(default_factory=NerSettings)
+    resource_limits: ResourceLimits = field(default_factory=ResourceLimits)
 
 
 class DenylistMatcher:
@@ -817,6 +861,13 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def keyed_digest(key: bytes, value: str) -> str:
+    """HMAC-SHA256 of value under a per-run key. Correlates repeated
+    occurrences of the same value within one run's report without being
+    reproducible across runs or reversible without the key."""
+    return hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 # Environment variables git uses to pin discovery to a specific repository,
@@ -1105,15 +1156,47 @@ def load_settings(path: Path) -> Settings:
         normalized(str(value)) for value in ner_raw.get("labels", DEFAULT_NER_LABELS)
         if normalized(str(value))
     )
+    max_findings_raw = ner_raw.get("max_findings", {"_default": DEFAULT_MAX_FINDINGS})
+    if not isinstance(max_findings_raw, dict):
+        raise SystemExit("Sanitizer configuration could not be read")
+    try:
+        max_findings = {str(key): int(value) for key, value in max_findings_raw.items()}
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("Sanitizer configuration could not be read") from exc
     settings.ner = NerSettings(
         enabled=bool(ner_raw.get("enabled", False)),
         model_dir=str(ner_raw.get("model_dir", NerSettings.model_dir)),
         labels=ner_labels or DEFAULT_NER_LABELS,
         threshold=float(ner_raw.get("threshold", NerSettings.threshold)),
-        max_findings=int(ner_raw.get("max_findings", NerSettings.max_findings)),
+        max_findings=max_findings,
     )
-    if not 0.05 <= settings.ner.threshold <= 1.0 or not 1 <= settings.ner.max_findings <= 10000:
+    if (
+        not 0.05 <= settings.ner.threshold <= 1.0
+        or not all(1 <= cap <= 10000 for cap in settings.ner.max_findings.values())
+    ):
         raise SystemExit("Configured NER review settings are outside the supported range")
+    limits_raw = raw.get("resource_limits", {})
+    if not isinstance(limits_raw, dict):
+        raise SystemExit("Sanitizer configuration could not be read")
+    settings.resource_limits = ResourceLimits(
+        max_memory_bytes=int(limits_raw.get("max_memory_bytes", ResourceLimits.max_memory_bytes)),
+        max_cpu_seconds=int(limits_raw.get("max_cpu_seconds", ResourceLimits.max_cpu_seconds)),
+        max_staging_disk_bytes=int(
+            limits_raw.get("max_staging_disk_bytes", ResourceLimits.max_staging_disk_bytes)
+        ),
+        resource_check_every_pages=int(
+            limits_raw.get("resource_check_every_pages", ResourceLimits.resource_check_every_pages)
+        ),
+        retention_days=int(limits_raw.get("retention_days", ResourceLimits.retention_days)),
+    )
+    if (
+        settings.resource_limits.max_memory_bytes <= 0
+        or settings.resource_limits.max_cpu_seconds <= 0
+        or settings.resource_limits.max_staging_disk_bytes <= 0
+        or settings.resource_limits.resource_check_every_pages <= 0
+        or settings.resource_limits.retention_days <= 0
+    ):
+        raise SystemExit("Configured resource limits are outside the supported range")
     for item in raw.get("regions", []):
         if not item.get("enabled", True):
             continue
@@ -1178,6 +1261,31 @@ def load_project_metadata(path: Path) -> set[str]:
     if not terms:
         raise SystemExit("The project metadata file yielded no usable identifiers")
     return terms
+
+
+def _blank_field_value(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, list):
+        return not any(isinstance(entry, str) and entry.strip() for entry in value)
+    return False
+
+
+def intake_empty_fields(path: Path | None) -> list[str]:
+    """`PROJECT_METADATA_FIELDS` entries missing or blank in the supplied
+    project-metadata file — the intake-completeness gate's audit trail. No
+    file at all counts every field as empty."""
+    if path is None:
+        return list(PROJECT_METADATA_FIELDS)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("The project metadata file is missing or invalid") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit("The project metadata file must contain an object")
+    return [name for name in PROJECT_METADATA_FIELDS if _blank_field_value(payload.get(name))]
 
 
 def derive_term_candidates(
@@ -2025,13 +2133,15 @@ class NerDetector:
         labels: Sequence[str],
         threshold: float,
         model_name: str,
-        max_findings: int = 500,
+        max_findings: Mapping[str, int] | None = None,
     ):
         self.predict = predict
         self.labels = tuple(labels)
         self.threshold = float(threshold)
         self.model_name = model_name
-        self.max_findings = int(max_findings)
+        self.max_findings: dict[str, int] = (
+            dict(max_findings) if max_findings else {"_default": DEFAULT_MAX_FINDINGS}
+        )
 
     def block_findings(self, blocks: Sequence[TextBlock]) -> Iterator[tuple[TextBlock, int, int, str, float]]:
         """Yield (block, start, end, label, score) with offsets into the
@@ -2190,6 +2300,60 @@ def process_peak_rss_bytes() -> int:
     return peak if platform.system() == "Darwin" else peak * 1024
 
 
+def _handle_cpu_limit_signal(signum: int, frame) -> None:  # noqa: ARG001 - signal handler signature
+    """Converts a hard RLIMIT_CPU breach (SIGXCPU) into the same controlled
+    failure path as any other page-processing error, instead of the default
+    action (terminating the process)."""
+    raise PageProcessingError(0, "CPU time ceiling exceeded")
+
+
+def apply_process_resource_limits(limits: ResourceLimits) -> None:
+    """Best-effort OS-level ceilings for the whole run's process.
+
+    One Python process handles every document in a run (see orchestrate_run),
+    so these limits are process-wide, not per-document. Each limit is applied
+    independently: RLIMIT_AS/RLIMIT_RSS enforcement is inconsistent across
+    platforms (notably unenforced on macOS), so a platform that rejects one
+    limit still gets the others rather than none at all.
+    """
+    for name in ("RLIMIT_AS", "RLIMIT_RSS"):
+        limit_id = getattr(resource, name, None)
+        if limit_id is None:
+            continue
+        try:
+            resource.setrlimit(limit_id, (limits.max_memory_bytes, limits.max_memory_bytes))
+        except (ValueError, OSError):
+            continue
+        break
+    try:
+        resource.setrlimit(resource.RLIMIT_CPU, (limits.max_cpu_seconds, limits.max_cpu_seconds))
+    except (ValueError, OSError, AttributeError):
+        pass
+    try:
+        signal.signal(signal.SIGXCPU, _handle_cpu_limit_signal)
+    except (ValueError, OSError, AttributeError):
+        pass
+
+
+def check_resource_ceilings(staging_dir: Path, limits: ResourceLimits, page_number: int = 0) -> None:
+    """Polled ceiling check for memory and staging-disk usage.
+
+    Called at page boundaries during processing (see sanitize_document). A
+    breach raises the same PageProcessingError the Tesseract/Ghostscript
+    timeouts already raise, so it reaches the existing FAIL-building path in
+    orchestrate_run unchanged. Disk usage has no OS-level rlimit equivalent
+    for a directory, so it's enforced here rather than via setrlimit.
+    """
+    peak_rss = process_peak_rss_bytes()
+    if peak_rss > limits.max_memory_bytes:
+        raise PageProcessingError(page_number, "memory ceiling exceeded")
+    staging_bytes = sum(
+        entry.stat().st_size for entry in staging_dir.rglob("*") if entry.is_file()
+    )
+    if staging_bytes > limits.max_staging_disk_bytes:
+        raise PageProcessingError(page_number, "staging disk usage ceiling exceeded")
+
+
 def rendered_ocr_verification(
     doc: fitz.Document,
     denylist: DenylistMatcher,
@@ -2335,6 +2499,7 @@ def verify_output(
     denylist: DenylistMatcher,
     raster_pages: set[int],
     triage_dir: Path,
+    run_key: bytes,
     ner_detector: NerDetector | None = None,
     lexicons: Lexicons | None = None,
     raster_page_failures: Sequence[dict] = (),
@@ -2351,6 +2516,7 @@ def verify_output(
     ner_suppressed: collections.Counter[str] = collections.Counter()
     ner_forms: dict[tuple[str, str], dict] = {}
     ner_forms_truncated: set[tuple[str, str]] = set()
+    ner_forms_by_label: collections.Counter[str] = collections.Counter()
     zone: str | None = None
     size_mismatch_pages: list[int] = []
     blank_render_pages: list[int] = []
@@ -2392,7 +2558,7 @@ def verify_output(
             entry = {
                 "page": page_index + 1,
                 "category": category,
-                "shape": masked_shape(match.group()),
+                "digest": keyed_digest(run_key, match.group()),
             }
             crop_name = f"residual_{len(residuals) + 1:04d}_page{page_index + 1:04d}_{category}.png"
             crop_path = render_residual_crop(
@@ -2434,13 +2600,14 @@ def verify_output(
                 form_key = (label, re.sub(r"\s+", " ", text).strip().casefold())
                 record = ner_forms.get(form_key)
                 if record is None:
-                    if len(ner_forms) >= ner_detector.max_findings:
+                    if ner_forms_by_label[label] >= ner_cap_for_label(ner_detector.max_findings, label):
                         ner_forms_truncated.add(form_key)
                         continue
+                    ner_forms_by_label[label] += 1
                     label_slug = re.sub(r"[^a-z0-9]+", "_", label.casefold()).strip("_") or "entity"
                     record = {
                         "label": label,
-                        "shape": masked_shape(text),
+                        "digest": keyed_digest(run_key, text),
                         "occurrences": 0,
                         "pages": [],
                         "score_max": 0.0,
@@ -2517,10 +2684,16 @@ def verify_output(
         distinct_by_label: collections.Counter[str] = collections.Counter()
         for label, _form in ner_forms:
             distinct_by_label[label] += 1
-        findings = sorted(
-            ner_forms.values(),
-            key=lambda record: (-record["occurrences"], record["label"], record["shape"]),
-        )
+        # Sort key uses the casefolded surface form (form_key[1]), not the
+        # digest: the digest is keyed by a fresh random secret each run, so
+        # sorting by it would make tie order vary run to run for the same
+        # document even though nothing about the document changed.
+        findings = [
+            record for _key, record in sorted(
+                ner_forms.items(),
+                key=lambda item: (-item[1]["occurrences"], item[1]["label"], item[0][1]),
+            )
+        ]
         result["ner_review"] = {
             "enabled": True,
             "mode": "report_only",
@@ -2546,6 +2719,7 @@ def sanitize_document(
     denylist: set[str],
     settings: Settings,
     temp_root: Path,
+    run_key: bytes,
     ner_detector: NerDetector | None = None,
     lexicons: Lexicons | None = None,
 ) -> dict:
@@ -2705,6 +2879,11 @@ def sanitize_document(
             raise PageProcessingError(page_number, "inspection or redaction failed") from exc
         if settings.progress_every_pages and page_number % settings.progress_every_pages == 0:
             print(f"{document_id}: sanitized {page_number}/{len(source_doc)} pages", file=sys.stderr)
+        if (
+            settings.resource_limits.resource_check_every_pages
+            and page_number % settings.resource_limits.resource_check_every_pages == 0
+        ):
+            check_resource_ceilings(destination.parent, settings.resource_limits, page_number)
 
     remove_interactive_content(source_doc)
     try:
@@ -2764,6 +2943,11 @@ def sanitize_document(
             raster_doc.close()
             if settings.progress_every_pages and page_number % settings.progress_every_pages == 0:
                 print(f"{document_id}: rebuilt {page_number}/{len(cleaned)} pages", file=sys.stderr)
+            if (
+                settings.resource_limits.resource_check_every_pages
+                and page_number % settings.resource_limits.resource_check_every_pages == 0
+            ):
+                check_resource_ceilings(destination.parent, settings.resource_limits, page_number)
         if vector_flattened is not None:
             vector_flattened.close()
         cleaned.close()
@@ -2788,6 +2972,7 @@ def sanitize_document(
     verification = verify_output(
         destination, source_sizes, matcher, raster_required,
         destination.parent / "triage" / document_id,
+        run_key,
         ner_detector=ner_detector, lexicons=lexicons,
         raster_page_failures=raster_page_failures,
         settings=settings,
@@ -2805,6 +2990,7 @@ def sanitize_document(
         verification = verify_output(
             destination, source_sizes, matcher, raster_required,
             destination.parent / "triage" / document_id,
+            run_key,
             ner_detector=ner_detector, lexicons=lexicons,
             raster_page_failures=raster_page_failures,
             settings=settings,
@@ -2854,20 +3040,45 @@ def inputs_from_args(values: Sequence[str]) -> Iterator[Path]:
             yield path
 
 
-def build_run_payload(reports: list[dict], fingerprint: dict, ner_enabled: bool) -> dict:
+def truncation_incompleteness_reasons(reports: list[dict]) -> list[str]:
+    """One reason per document whose residual or NER review list was
+    truncated — the same incompleteness signal as an unfinished review,
+    per CONTEXT.md."""
+    reasons = []
+    for report in reports:
+        document_id = report.get("document_id", "unknown document")
+        if report.get("residuals_truncated"):
+            reasons.append(f"{document_id}: residual findings truncated")
+        ner_review = report.get("ner_review") or {}
+        if ner_review.get("findings_truncated"):
+            reasons.append(f"{document_id}: NER review findings truncated")
+    return reasons
+
+
+def build_run_payload(
+    reports: list[dict], fingerprint: dict, ner_enabled: bool,
+    intake_status: dict | None = None,
+) -> dict:
     all_automated_checks_pass = all(
         report["release_status"] == RELEASE_STATUS_AUTOMATED_PASS for report in reports
     )
+    incompleteness_reasons = truncation_incompleteness_reasons(reports)
+    if intake_status is not None and intake_status["empty_fields"] and not intake_status["waiver"]:
+        incompleteness_reasons.append(
+            "project intake metadata missing or incomplete: "
+            + ", ".join(intake_status["empty_fields"])
+        )
     payload = {
-        "schema_version": 3,
+        "schema_version": 4,
         "documents": reports,
         "all_automated_checks_pass": all_automated_checks_pass,
         "release_status": derive_release_status(
             RELEASE_STATUS_AUTOMATED_PASS if all_automated_checks_pass else RELEASE_STATUS_FAIL,
+            incompleteness_reasons=incompleteness_reasons,
         ),
         "fingerprint": fingerprint,
         "notes": [
-            "The report contains counts, categories, page numbers, masked shapes, and hashes only.",
+            "The report contains counts, categories, page numbers, keyed digests, and hashes only. Digests are keyed by a random per-run secret that is never written to disk: values correlate within this report but not across runs, and cannot be reversed without the key.",
             "Residual triage crops under the output triage/ directory contain original page regions; treat them as NDA material and delete after review.",
             "Automated checks do not guarantee NDA compliance.",
             "An NDA-authorized person must visually review every page locally before any AI submission.",
@@ -2876,6 +3087,10 @@ def build_run_payload(reports: list[dict], fingerprint: dict, ner_enabled: bool)
     if ner_enabled:
         payload["notes"].append(
             "NER review findings are report-only candidates for human triage; they never change automated checks."
+        )
+    if incompleteness_reasons:
+        payload["notes"].append(
+            "This run cannot reach RELEASED until resolved: " + "; ".join(incompleteness_reasons)
         )
     return payload
 
@@ -2958,7 +3173,7 @@ def manifest_document(report: dict, run_dir: Path) -> dict:
 
 def build_manifest(
     *, run_id: str, started_at: str, completed_at: str, payload: dict,
-    fingerprint: dict, versions: dict, run_dir: Path,
+    fingerprint: dict, versions: dict, run_dir: Path, intake_status: dict,
 ) -> dict:
     documents = [manifest_document(report, run_dir) for report in payload["documents"]]
     return {
@@ -2990,6 +3205,7 @@ def build_manifest(
             "reviewer": None,
             "completed_at": None,
         },
+        "intake": intake_status,
     }
 
 
@@ -3020,6 +3236,7 @@ def orchestrate_run(
     denylist_path: Path | None, project_metadata_path: Path | None,
     config_path: Path, allowlist_path: Path | None, lexicon_dir: Path,
     lexicons: Lexicons | None, ner_detector: NerDetector | None,
+    intake_waiver: str | None = None,
     script_path: Path = Path(__file__), repo_root: Path | None = None,
 ) -> tuple[Path, dict]:
     """Build a complete run in a private temp directory, then publish once.
@@ -3029,6 +3246,7 @@ def orchestrate_run(
     """
     output_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(output_root, 0o700)
+    run_key = secrets.token_bytes(32)
     run_id = generate_run_id()
     final_dir = output_root / run_id
     while final_dir.exists():
@@ -3057,7 +3275,7 @@ def orchestrate_run(
             print(f"{active_id}: processing input {len(reports) + 1}/{len(sources)}", file=sys.stderr)
             started = time.perf_counter()
             report = sanitize_document(
-                source, destination, active_id, denylist, settings, temp_root,
+                source, destination, active_id, denylist, settings, temp_root, run_key,
                 ner_detector=ner_detector, lexicons=lexicons,
             )
             report["processing_seconds"] = round(time.perf_counter() - started, 6)
@@ -3077,18 +3295,63 @@ def orchestrate_run(
             "release_status": RELEASE_STATUS_FAIL,
             "fail_reason": reason,
         })
-    payload = build_run_payload(reports, fingerprint, ner_detector is not None)
+    intake_status = {
+        "project_metadata_supplied": project_metadata_path is not None,
+        "empty_fields": intake_empty_fields(project_metadata_path),
+        "waiver": intake_waiver,
+    }
+    payload = build_run_payload(
+        reports, fingerprint, ner_detector is not None, intake_status=intake_status,
+    )
     completed_at = utc_timestamp()
     versions = runtime_versions(settings, ner_detector)
     manifest = build_manifest(
         run_id=run_id, started_at=started_at, completed_at=completed_at,
         payload=payload, fingerprint=fingerprint, versions=versions, run_dir=staging_dir,
+        intake_status=intake_status,
     )
     write_private_text(staging_dir / "report.json", json.dumps(payload, indent=2) + "\n")
     write_private_text(staging_dir / "manifest.json", json.dumps(manifest, indent=2) + "\n")
     write_private_text(staging_dir / "review-summary.md", review_summary(run_id, payload, manifest))
     os.replace(staging_dir, final_dir)
+    if payload["all_automated_checks_pass"]:
+        # Confidential residual crops are only needed for triage on a run
+        # that still requires review or investigation; a fully clean run has
+        # nothing left to review, so the NDA-sensitive material is deleted
+        # rather than left to accumulate (issue #8's "light version" scope
+        # explicitly excludes cleanup on failure/crash). A real deletion
+        # failure should surface loudly rather than leave NDA material
+        # behind unnoticed, so this doesn't swallow errors the way
+        # ignore_errors=True would.
+        triage_dir = final_dir / "triage"
+        if triage_dir.exists():
+            shutil.rmtree(triage_dir)
     return final_dir, payload
+
+
+def prune_expired_runs(
+    output_root: Path, retention_days: int, *, now: dt.datetime | None = None,
+) -> list[Path]:
+    """Delete published run directories older than retention_days.
+
+    An explicit maintenance step (see tools/prune_runs.py), never run
+    automatically on every invocation. Directories whose name starts with
+    "." are a staging dir from a run that never finished publishing (crashed
+    before its atomic rename in orchestrate_run) and are left untouched —
+    startup recovery for abandoned runs is explicitly out of scope.
+    """
+    if not output_root.is_dir():
+        return []
+    cutoff = (now or dt.datetime.now(dt.timezone.utc)) - dt.timedelta(days=retention_days)
+    removed: list[Path] = []
+    for entry in sorted(output_root.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        mtime = dt.datetime.fromtimestamp(entry.stat().st_mtime, dt.timezone.utc)
+        if mtime < cutoff:
+            shutil.rmtree(entry)
+            removed.append(entry)
+    return removed
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -3104,6 +3367,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--project-metadata", type=Path, default=None,
         help="project intake JSON (name, number, address, parties, personnel); the "
              "primary way to seed the denylist, merged with --denylist when both are given",
+    )
+    parser.add_argument(
+        "--intake-waiver", type=str, default=None,
+        help="explicit recorded reason bypassing the intake-completeness gate when "
+             "--project-metadata is missing or has empty fields; recorded verbatim in the manifest",
     )
     parser.add_argument("--lexicons", type=Path, default=Path(DEFAULT_LEXICON_DIR))
     parser.add_argument("--allowlist", type=Path, default=Path(DEFAULT_ALLOWLIST))
@@ -3133,6 +3401,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not source.is_file() or source.suffix.casefold() != ".pdf":
             raise SystemExit("An input is not a readable PDF file")
     settings = load_settings(args.config)
+    apply_process_resource_limits(settings.resource_limits)
     if settings.detect_barcodes and zxingcpp is None:
         raise SystemExit("The local barcode decoder dependency is missing")
     lexicons = load_lexicons(args.lexicons, args.allowlist)
@@ -3175,6 +3444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         lexicon_dir=args.lexicons,
         lexicons=lexicons,
         ner_detector=ner_detector,
+        intake_waiver=args.intake_waiver,
     )
     print(json.dumps({
         "run_directory": str(run_dir),

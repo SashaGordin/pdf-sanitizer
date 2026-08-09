@@ -51,6 +51,16 @@ These are deliberately gitignored. A fresh clone will not have them:
   the golden-set eval, blocking `git push` on either's failure. `core.hooksPath`
   is a local repo setting, not itself versioned, so a fresh clone needs one
   command to activate it: `git config core.hooksPath tools/git-hooks`.
+- **Dependency lockfiles.** `requirements-anonymizer.lock.txt` and
+  `requirements-anonymizer-ner.lock.txt` are hash-pinned lockfiles generated
+  from the range-specified `requirements-anonymizer.txt`/
+  `requirements-anonymizer-ner.txt`. For a reproducible install:
+  `.venv-anonymizer/bin/python -m pip install --require-hashes -r requirements-anonymizer.lock.txt -r requirements-anonymizer-ner.lock.txt`.
+  The unpinned `.txt` files remain the source of truth for version ranges;
+  regenerate a lockfile after changing its range spec with
+  `.venv-anonymizer/bin/python -m pip install pip-tools` once, then
+  `.venv-anonymizer/bin/python -m piptools compile --generate-hashes --allow-unsafe --output-file=<name>.lock.txt <name>.txt`
+  (also documented as a comment at the top of each `.txt` file).
 
 ## Agent skills
 

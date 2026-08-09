@@ -1,4 +1,10 @@
 # Optional report-only NER review layer. Installs torch (~1 GB); keep it out
 # of the core requirements. Model weights are downloaded once, separately —
 # see ANONYMIZATION.md. The sanitizer itself never accesses the network.
+#
+# Version ranges are the source of truth; regenerate the hash-pinned lockfile
+# (requirements-anonymizer-ner.lock.txt) with:
+#   .venv-anonymizer/bin/python -m pip install pip-tools
+#   .venv-anonymizer/bin/python -m piptools compile --generate-hashes --allow-unsafe \
+#       --output-file=requirements-anonymizer-ner.lock.txt requirements-anonymizer-ner.txt
 gliner>=0.2,<1
