@@ -1,3 +1,8 @@
+# Version ranges are the source of truth; regenerate the hash-pinned lockfile
+# (requirements-anonymizer.lock.txt) with:
+#   .venv-anonymizer/bin/python -m pip install pip-tools
+#   .venv-anonymizer/bin/python -m piptools compile --generate-hashes --allow-unsafe \
+#       --output-file=requirements-anonymizer.lock.txt requirements-anonymizer.txt
 PyMuPDF>=1.24,<2
 Pillow>=10,<13
 zxing-cpp>=2.2,<4
