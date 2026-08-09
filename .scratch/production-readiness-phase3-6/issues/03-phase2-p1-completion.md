@@ -20,7 +20,9 @@ three — no further design ticket was needed.
 
 **Blocked by:** none.
 
-**Status:** todo
+**Status:** ready-for-agent
+
+**GitHub issue:** https://github.com/SashaGordin/pdf-sanitizer/issues/20
 
 - [ ] A synthetic document with a high-volume label (e.g. many `organization`
       matches) and a low-volume high-value label (e.g. one `street address`)

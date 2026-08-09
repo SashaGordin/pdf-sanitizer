@@ -29,7 +29,9 @@ or lexicons.
 
 **Blocked by:** none.
 
-**Status:** todo
+**Status:** ready-for-agent
+
+**GitHub issue:** https://github.com/SashaGordin/pdf-sanitizer/issues/23
 
 - [ ] Launching the tool against a real run directory shows that run's real
       findings, each with its real crop and a plain-language category guess

@@ -28,7 +28,9 @@ engagement.
 
 **Blocked by:** 05 (needs the assembled locked corpus).
 
-**Status:** todo
+**Status:** ready-for-agent
+
+**GitHub issue:** https://github.com/SashaGordin/pdf-sanitizer/issues/24
 
 - [ ] A full pipeline run against the locked corpus completes and produces a
       report/manifest for every corpus document.
