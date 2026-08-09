@@ -12,6 +12,7 @@ import collections
 import csv
 import datetime as dt
 import hashlib
+import hmac
 import importlib.metadata
 import io
 import json
@@ -19,6 +20,7 @@ import os
 import platform
 import re
 import resource
+import secrets
 import shutil
 import subprocess
 import sys
@@ -226,7 +228,7 @@ class Detection:
     """One located candidate, with enough provenance to audit and measure it.
 
     `text` is the matched string. It stays in memory for suppression decisions
-    and is never serialized — the report carries masked shapes only.
+    and is never serialized — the report carries keyed digests only.
     """
 
     rect: fitz.Rect
@@ -817,6 +819,13 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def keyed_digest(key: bytes, value: str) -> str:
+    """HMAC-SHA256 of value under a per-run key. Correlates repeated
+    occurrences of the same value within one run's report without being
+    reproducible across runs or reversible without the key."""
+    return hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 # Environment variables git uses to pin discovery to a specific repository,
@@ -2335,6 +2344,7 @@ def verify_output(
     denylist: DenylistMatcher,
     raster_pages: set[int],
     triage_dir: Path,
+    run_key: bytes,
     ner_detector: NerDetector | None = None,
     lexicons: Lexicons | None = None,
     raster_page_failures: Sequence[dict] = (),
@@ -2392,7 +2402,7 @@ def verify_output(
             entry = {
                 "page": page_index + 1,
                 "category": category,
-                "shape": masked_shape(match.group()),
+                "digest": keyed_digest(run_key, match.group()),
             }
             crop_name = f"residual_{len(residuals) + 1:04d}_page{page_index + 1:04d}_{category}.png"
             crop_path = render_residual_crop(
@@ -2440,7 +2450,7 @@ def verify_output(
                     label_slug = re.sub(r"[^a-z0-9]+", "_", label.casefold()).strip("_") or "entity"
                     record = {
                         "label": label,
-                        "shape": masked_shape(text),
+                        "digest": keyed_digest(run_key, text),
                         "occurrences": 0,
                         "pages": [],
                         "score_max": 0.0,
@@ -2517,10 +2527,16 @@ def verify_output(
         distinct_by_label: collections.Counter[str] = collections.Counter()
         for label, _form in ner_forms:
             distinct_by_label[label] += 1
-        findings = sorted(
-            ner_forms.values(),
-            key=lambda record: (-record["occurrences"], record["label"], record["shape"]),
-        )
+        # Sort key uses the casefolded surface form (form_key[1]), not the
+        # digest: the digest is keyed by a fresh random secret each run, so
+        # sorting by it would make tie order vary run to run for the same
+        # document even though nothing about the document changed.
+        findings = [
+            record for _key, record in sorted(
+                ner_forms.items(),
+                key=lambda item: (-item[1]["occurrences"], item[1]["label"], item[0][1]),
+            )
+        ]
         result["ner_review"] = {
             "enabled": True,
             "mode": "report_only",
@@ -2546,6 +2562,7 @@ def sanitize_document(
     denylist: set[str],
     settings: Settings,
     temp_root: Path,
+    run_key: bytes,
     ner_detector: NerDetector | None = None,
     lexicons: Lexicons | None = None,
 ) -> dict:
@@ -2788,6 +2805,7 @@ def sanitize_document(
     verification = verify_output(
         destination, source_sizes, matcher, raster_required,
         destination.parent / "triage" / document_id,
+        run_key,
         ner_detector=ner_detector, lexicons=lexicons,
         raster_page_failures=raster_page_failures,
         settings=settings,
@@ -2805,6 +2823,7 @@ def sanitize_document(
         verification = verify_output(
             destination, source_sizes, matcher, raster_required,
             destination.parent / "triage" / document_id,
+            run_key,
             ner_detector=ner_detector, lexicons=lexicons,
             raster_page_failures=raster_page_failures,
             settings=settings,
@@ -2859,7 +2878,7 @@ def build_run_payload(reports: list[dict], fingerprint: dict, ner_enabled: bool)
         report["release_status"] == RELEASE_STATUS_AUTOMATED_PASS for report in reports
     )
     payload = {
-        "schema_version": 3,
+        "schema_version": 4,
         "documents": reports,
         "all_automated_checks_pass": all_automated_checks_pass,
         "release_status": derive_release_status(
@@ -2867,7 +2886,7 @@ def build_run_payload(reports: list[dict], fingerprint: dict, ner_enabled: bool)
         ),
         "fingerprint": fingerprint,
         "notes": [
-            "The report contains counts, categories, page numbers, masked shapes, and hashes only.",
+            "The report contains counts, categories, page numbers, keyed digests, and hashes only. Digests are keyed by a random per-run secret that is never written to disk: values correlate within this report but not across runs, and cannot be reversed without the key.",
             "Residual triage crops under the output triage/ directory contain original page regions; treat them as NDA material and delete after review.",
             "Automated checks do not guarantee NDA compliance.",
             "An NDA-authorized person must visually review every page locally before any AI submission.",
@@ -3029,6 +3048,7 @@ def orchestrate_run(
     """
     output_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(output_root, 0o700)
+    run_key = secrets.token_bytes(32)
     run_id = generate_run_id()
     final_dir = output_root / run_id
     while final_dir.exists():
@@ -3057,7 +3077,7 @@ def orchestrate_run(
             print(f"{active_id}: processing input {len(reports) + 1}/{len(sources)}", file=sys.stderr)
             started = time.perf_counter()
             report = sanitize_document(
-                source, destination, active_id, denylist, settings, temp_root,
+                source, destination, active_id, denylist, settings, temp_root, run_key,
                 ner_detector=ner_detector, lexicons=lexicons,
             )
             report["processing_seconds"] = round(time.perf_counter() - started, 6)
