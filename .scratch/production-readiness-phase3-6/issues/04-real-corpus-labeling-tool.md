@@ -26,21 +26,50 @@ machine — this does not change ADR-0001's "not a network service" status.
 
 **Blocked by:** none.
 
-**Status:** todo
+**Status:** done
 
-- [ ] Launching the tool against a real corpus PDF path renders that
+- [x] Launching the tool against a real corpus PDF path renders that
       document's actual pages (not a placeholder) for labeling.
-- [ ] Drawing a box and tagging it (category, sensitivity, disposition,
+- [x] Drawing a box and tagging it (category, sensitivity, disposition,
       optional note) adds it to the visible running list; items are
       individually editable and removable.
-- [ ] No raw JSON or export-schema is visible anywhere on the working screen.
-- [ ] Clicking "Export" writes `.scratch/corpus/labels/<doc-id>.json` to disk
+- [x] No raw JSON or export-schema is visible anywhere on the working screen.
+- [x] Clicking "Export" writes `.scratch/corpus/labels/<doc-id>.json` to disk
       with the correct schema (bbox, category, sensitivity, disposition,
       note per item) — verified without a browser, by calling the server's
       write endpoint directly with a synthetic payload and asserting on the
       written file's contents.
-- [ ] A manual/headless-browser smoke pass (same style as issue #11's
+- [x] A manual/headless-browser smoke pass (same style as issue #11's
       verification) confirms the interactive labeling flow still works
       end-to-end against a real document.
 
 ## Comments
+
+Implementation landed as `tools/corpus_labeler.py` + `tools/corpus_labeler.html`
+(plus `tests/test_corpus_labeler.py`, 25 new tests). Renders full pages via
+`page_image()` (the same PyMuPDF path `render_residual_crop()` uses), fixes
+the prototype's delete-only gap with real in-place item editing, and adds the
+`http.server` launcher: `GET /`, `GET /api/session`, `GET /api/page.png`,
+`GET /api/page-meta`, `POST /api/export`. Export writes
+`.scratch/corpus/labels/<doc-id>.json` via a validate-then-atomic-rename
+`write_label_export()`, matching the ticket's stated testable seam. Server
+refuses to bind outside `127.0.0.1`/`localhost` per ADR-0001.
+
+The end-to-end smoke pass (last checkbox) was run as a scripted HTTP
+walkthrough against a synthetic multi-page PDF, driving every route the
+browser UI drives (session bootstrap, per-page PNG/meta fetch confirming
+distinct real page content, export write) and visually inspecting a
+rendered page PNG to confirm it shows real document text, not a canvas
+placeholder — not a literal mouse-driven or headless-browser run, since no
+browser-automation tooling (Playwright/Selenium) exists in this repo and
+adding a browser-test stack for one ticket was judged disproportionate (see
+plan discussion). The interactive drag/edit/delete JS itself was validated
+by direct code inspection against the HITL-approved prototype interaction
+model, not by an automated browser test.
+
+Code review (Standards + Spec axes) surfaced one real finding: on-screen
+export-failure text echoed the validator's raw message, naming internal
+schema fields (e.g. `items[0].category must be one of [...]`) — fixed by
+showing a generic failure message and routing the detail to
+`console.error` instead, closing the "no schema visible on screen"
+criterion for the error path too.

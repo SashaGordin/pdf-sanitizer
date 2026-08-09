@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Corpus labeling tool</title>
+<style>
+  :root {
+    --sensitive: #b4232a;
+    --safe: #1f7a3f;
+    --ink: #1c1c1c;
+    --paper: #faf8f3;
+    --accent: #2255aa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    margin: 0; padding: 0;
+    background: #f0f0ee; color: var(--ink);
+  }
+  #app { max-width: 1200px; margin: 0 auto; padding: 26px 20px 40px; }
+  h1 { font-size: 21px; margin: 0 0 6px 0; letter-spacing: -0.01em; }
+  .sub { color: #5a5a5a; font-size: 13.5px; line-height: 1.5; margin-bottom: 18px; max-width: 900px; }
+
+  .layout { display: flex; gap: 22px; align-items: flex-start; }
+  .page-col { flex: 0 0 auto; }
+  .side-col { flex: 1; min-width: 320px; }
+
+  .page-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; font-size: 13px; }
+
+  .page-wrap {
+    position: relative;
+    background: var(--paper);
+    border: 1px solid #d8d2c2;
+    border-radius: 3px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    max-width: 82vw;
+    max-height: 82vh;
+    overflow: auto;
+  }
+  #pageImg { display: block; }
+  #overlay {
+    position: absolute; top: 0; left: 0;
+    cursor: crosshair;
+  }
+  .canvas-caption { font-size: 12px; color: #777; margin-top: 8px; max-width: 720px; line-height: 1.4; }
+
+  .panel {
+    background: #fff; border: 1px solid #e2e2e2; border-radius: 8px;
+    padding: 16px; margin-bottom: 16px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  }
+  .panel h2 { font-size: 13.5px; margin: 0 0 12px 0; color: #333; }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; font-size: 12px; color: #666; margin-bottom: 4px; }
+  .field select, .field input[type=text] {
+    width: 100%; padding: 7px 9px; font-size: 13px; border: 1px solid #d3d3d3; border-radius: 5px;
+  }
+  .field select:focus, .field input[type=text]:focus { outline: none; border-color: var(--accent); }
+  .radio-row { display: flex; gap: 16px; font-size: 13px; }
+  .radio-row label { display: flex; align-items: center; gap: 5px; font-size: 13px; color: var(--ink); margin: 0; }
+
+  .btn-row { display: flex; gap: 8px; margin-top: 14px; }
+  button {
+    padding: 8px 15px; border-radius: 6px; border: 1px solid #ccc;
+    background: #fff; font-size: 13px; cursor: pointer; transition: background 0.1s;
+  }
+  button:hover { background: #f5f5f5; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover { background: #1c468c; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .item-list { list-style: none; margin: 0; padding: 0; max-height: 320px; overflow-y: auto; }
+  .item-list li {
+    padding: 9px 4px; border-bottom: 1px solid #f0f0f0; font-size: 12.5px;
+    display: flex; justify-content: space-between; gap: 8px; align-items: center;
+  }
+  .item-list li:last-child { border-bottom: none; }
+  .item-list li:hover { background: #fafafa; }
+  .tag {
+    display: inline-block; padding: 1px 7px; border-radius: 10px; font-weight: 600;
+    font-size: 10.5px; margin-left: 7px;
+  }
+  .tag.sensitive { background: #fde7e7; color: var(--sensitive); }
+  .tag.not_sensitive { background: #e6f4ea; color: var(--safe); }
+  .item-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+  .item-action { color: #888; cursor: pointer; font-size: 12px; }
+  .item-action.delete:hover { color: var(--sensitive); }
+  .item-action.edit:hover { color: var(--accent); }
+  .item-page { color: #aaa; font-size: 11px; margin-left: 6px; }
+
+  .panel-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; }
+  .export-status { font-size: 12px; color: #1f7a3f; }
+  .export-status.error { color: var(--sensitive); }
+  .empty-note { font-size: 13px; color: #999; padding: 12px 0; }
+</style>
+</head>
+<body>
+<div id="app">
+  <h1>Corpus labeling tool</h1>
+  <div class="sub" id="docSummary">Loading document...</div>
+
+  <div class="layout">
+    <div class="page-col">
+      <div class="page-toolbar">
+        <button id="prevPage">&larr; Prev</button>
+        <span id="pageIndicator">Page 1 of 1</span>
+        <button id="nextPage">Next &rarr;</button>
+      </div>
+      <div class="page-wrap">
+        <img id="pageImg" alt="Rendered PDF page">
+        <canvas id="overlay"></canvas>
+      </div>
+      <div class="canvas-caption">
+        Drag a box on the page, then tag it: category, sensitivity decision, expected
+        disposition, and an optional note.
+      </div>
+    </div>
+
+    <div class="side-col">
+      <div class="panel" id="formPanel" style="display:none;">
+        <h2 id="formTitle">Tag this box</h2>
+        <div class="field">
+          <label for="category">Category</label>
+          <select id="category"></select>
+        </div>
+        <div class="field">
+          <label>Sensitivity decision</label>
+          <div class="radio-row">
+            <label><input type="radio" name="sensitivity" value="sensitive" checked> Sensitive</label>
+            <label><input type="radio" name="sensitivity" value="not_sensitive"> Not sensitive</label>
+          </div>
+        </div>
+        <div class="field">
+          <label>Expected disposition</label>
+          <div class="radio-row">
+            <label><input type="radio" name="disposition" value="redact" checked> Redact</label>
+            <label><input type="radio" name="disposition" value="keep"> Keep</label>
+          </div>
+        </div>
+        <div class="field">
+          <label for="note">Note (optional -- e.g. why sensitivity and disposition diverge, a hard-negative case)</label>
+          <input type="text" id="note" placeholder="e.g. looks like an identifier but is boilerplate">
+        </div>
+        <div class="btn-row">
+          <button class="primary" id="saveItem">Save labeled item</button>
+          <button id="cancelItem">Cancel</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Labeled items (<span id="itemCount">0</span>)</h2>
+        <ul class="item-list" id="itemList"></ul>
+        <div class="empty-note" id="emptyNote">Draw a box on the page to add the first item.</div>
+        <div class="panel-footer">
+          <button class="primary" id="exportItems" disabled>Export labeled items</button>
+          <span class="export-status" id="exportStatus"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const img = document.getElementById("pageImg");
+const canvas = document.getElementById("overlay");
+const ctx = canvas.getContext("2d");
+
+let session = null;      // {doc_id, source_pdf, page_count, categories, sensitivity_values, disposition_values}
+let currentPage = 0;
+let pageMeta = null;     // {width, height, scale} for currentPage
+let items = [];          // full session item list, spanning all visited pages
+let dragStart = null;
+let draftBox = null;
+let nextId = 1;
+let editingId = null;
+
+function paintBox(bbox, color, dashed) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  if (dashed) ctx.setLineDash([5, 4]);
+  ctx.strokeRect(bbox[0], bbox[1], bbox[2] - bbox[0], bbox[3] - bbox[1]);
+  ctx.restore();
+}
+
+function redraw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  items
+    .filter((item) => item.page === currentPage)
+    .forEach((item) => paintBox(item.bbox, item.sensitivity === "sensitive" ? "#b4232a" : "#1f7a3f"));
+  if (draftBox) paintBox(draftBox, "#2255aa", true);
+}
+
+async function loadSession() {
+  const res = await fetch("/api/session");
+  session = await res.json();
+  document.getElementById("docSummary").textContent =
+    `${session.source_pdf} -- ${session.page_count} page${session.page_count === 1 ? "" : "s"} (doc-id: ${session.doc_id})`;
+
+  const select = document.getElementById("category");
+  select.innerHTML = "";
+  const groups = { sensitive: null, negative: null };
+  const groupLabels = { sensitive: "Sensitive-leaning", negative: "Negative-leaning" };
+  session.categories.forEach((cat) => {
+    let parent = select;
+    if (cat.group) {
+      if (!groups[cat.group]) {
+        groups[cat.group] = document.createElement("optgroup");
+        groups[cat.group].label = groupLabels[cat.group] || cat.group;
+        select.appendChild(groups[cat.group]);
+      }
+      parent = groups[cat.group];
+    }
+    const option = document.createElement("option");
+    option.value = cat.value;
+    option.textContent = cat.label;
+    parent.appendChild(option);
+  });
+
+  await loadPage(0);
+}
+
+async function loadPage(index) {
+  const metaRes = await fetch(`/api/page-meta?index=${index}`);
+  if (!metaRes.ok) return;
+  pageMeta = await metaRes.json();
+  currentPage = index;
+
+  img.src = `/api/page.png?index=${index}&_=${Date.now()}`;
+  await new Promise((resolve) => { img.onload = resolve; });
+
+  img.width = pageMeta.width;
+  img.height = pageMeta.height;
+  canvas.width = pageMeta.width;
+  canvas.height = pageMeta.height;
+
+  document.getElementById("pageIndicator").textContent = `Page ${index + 1} of ${session.page_count}`;
+  document.getElementById("prevPage").disabled = index === 0;
+  document.getElementById("nextPage").disabled = index === session.page_count - 1;
+
+  draftBox = null;
+  document.getElementById("formPanel").style.display = "none";
+  editingId = null;
+  redraw();
+}
+
+document.getElementById("prevPage").addEventListener("click", () => {
+  if (currentPage > 0) loadPage(currentPage - 1);
+});
+document.getElementById("nextPage").addEventListener("click", () => {
+  if (currentPage < session.page_count - 1) loadPage(currentPage + 1);
+});
+
+canvas.addEventListener("mousedown", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  dragStart = [e.clientX - rect.left, e.clientY - rect.top];
+  draftBox = null;
+  editingId = null;
+  document.getElementById("formPanel").style.display = "none";
+});
+
+canvas.addEventListener("mousemove", (e) => {
+  if (!dragStart) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  draftBox = [Math.min(dragStart[0], x), Math.min(dragStart[1], y), Math.max(dragStart[0], x), Math.max(dragStart[1], y)];
+  redraw();
+});
+
+canvas.addEventListener("mouseup", () => {
+  if (draftBox && (draftBox[2] - draftBox[0] > 6) && (draftBox[3] - draftBox[1] > 6)) {
+    openForm({ mode: "create" });
+  } else {
+    draftBox = null;
+    redraw();
+  }
+  dragStart = null;
+});
+
+function openForm({ mode, item }) {
+  document.getElementById("formPanel").style.display = "block";
+  document.getElementById("formTitle").textContent = mode === "edit" ? "Edit labeled item" : "Tag this box";
+  if (mode === "edit" && item) {
+    document.getElementById("category").value = item.category;
+    document.querySelector(`input[name=sensitivity][value=${item.sensitivity}]`).checked = true;
+    document.querySelector(`input[name=disposition][value=${item.disposition}]`).checked = true;
+    document.getElementById("note").value = item.note || "";
+    editingId = item.id;
+  } else {
+    document.getElementById("category").value = "person";
+    document.querySelector('input[name=sensitivity][value=sensitive]').checked = true;
+    document.querySelector('input[name=disposition][value=redact]').checked = true;
+    document.getElementById("note").value = "";
+    editingId = null;
+  }
+}
+
+document.getElementById("saveItem").addEventListener("click", () => {
+  const category = document.getElementById("category").value;
+  const sensitivity = document.querySelector('input[name=sensitivity]:checked').value;
+  const disposition = document.querySelector('input[name=disposition]:checked').value;
+  const note = document.getElementById("note").value || null;
+
+  if (editingId) {
+    const item = items.find((i) => i.id === editingId);
+    if (item) Object.assign(item, { category, sensitivity, disposition, note });
+  } else if (draftBox) {
+    items.push({
+      id: `item-${String(nextId++).padStart(3, "0")}`,
+      page: currentPage,
+      bbox: draftBox.map((v) => Math.round(v)),
+      scale: pageMeta.scale,
+      category, sensitivity, disposition, note,
+    });
+  }
+
+  draftBox = null;
+  editingId = null;
+  document.getElementById("formPanel").style.display = "none";
+  renderItems();
+  redraw();
+});
+
+document.getElementById("cancelItem").addEventListener("click", () => {
+  draftBox = null;
+  editingId = null;
+  document.getElementById("formPanel").style.display = "none";
+  redraw();
+});
+
+function renderItems() {
+  const list = document.getElementById("itemList");
+  const empty = document.getElementById("emptyNote");
+  list.innerHTML = "";
+  document.getElementById("itemCount").textContent = items.length;
+  empty.style.display = items.length ? "none" : "block";
+  document.getElementById("exportItems").disabled = items.length === 0;
+  document.getElementById("exportStatus").textContent = "";
+  document.getElementById("exportStatus").classList.remove("error");
+
+  items.forEach((item) => {
+    const li = document.createElement("li");
+    const label = document.createElement("span");
+    label.textContent = item.category;
+    const tag = document.createElement("span");
+    tag.className = `tag ${item.sensitivity}`;
+    tag.textContent = item.sensitivity === "sensitive" ? "sensitive" : "not sensitive";
+    label.appendChild(tag);
+    label.appendChild(document.createTextNode(` → ${item.disposition}`));
+    const pageBadge = document.createElement("span");
+    pageBadge.className = "item-page";
+    pageBadge.textContent = `p.${item.page + 1}`;
+    label.appendChild(pageBadge);
+
+    const actions = document.createElement("span");
+    actions.className = "item-actions";
+    const editBtn = document.createElement("span");
+    editBtn.className = "item-action edit";
+    editBtn.textContent = "Edit";
+    editBtn.addEventListener("click", async () => {
+      if (item.page !== currentPage) await loadPage(item.page);
+      openForm({ mode: "edit", item });
+    });
+    const delBtn = document.createElement("span");
+    delBtn.className = "item-action delete";
+    delBtn.textContent = "Delete";
+    delBtn.addEventListener("click", () => {
+      items = items.filter((i) => i.id !== item.id);
+      renderItems();
+      redraw();
+    });
+    actions.appendChild(editBtn);
+    actions.appendChild(delBtn);
+
+    li.appendChild(label);
+    li.appendChild(actions);
+    list.appendChild(li);
+  });
+}
+
+document.getElementById("exportItems").addEventListener("click", async () => {
+  const statusEl = document.getElementById("exportStatus");
+  try {
+    const res = await fetch("/api/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items }),
+    });
+    const result = await res.json();
+    if (res.ok && result.status === "ok") {
+      statusEl.classList.remove("error");
+      statusEl.textContent = `Saved ${result.item_count} item${result.item_count === 1 ? "" : "s"} to ${result.path}.`;
+    } else {
+      console.error("Export rejected:", result.message);
+      statusEl.classList.add("error");
+      statusEl.textContent = "Export failed: the labeled items didn't pass validation. See the browser console for details.";
+    }
+  } catch (err) {
+    statusEl.classList.add("error");
+    statusEl.textContent = "Export failed: could not reach the local server.";
+  }
+});
+
+loadSession();
+renderItems();
+</script>
+</body>
+</html>
