@@ -22,6 +22,7 @@ import re
 import resource
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -731,6 +732,23 @@ class NerSettings:
     max_findings: int = 500
 
 
+@dataclass(frozen=True)
+class ResourceLimits:
+    """Process-wide ceilings for one CLI invocation (Phase 5 operational scope).
+
+    RLIMIT_AS/RLIMIT_CPU are process-wide, not per-document, because the whole
+    run's document batch shares one Python process (see orchestrate_run). The
+    disk ceiling has no OS-level rlimit equivalent for a directory, so it's
+    enforced by explicit polling instead.
+    """
+
+    max_memory_bytes: int = 4 * 1024**3
+    max_cpu_seconds: int = 3600
+    max_staging_disk_bytes: int = 8 * 1024**3
+    resource_check_every_pages: int = 25
+    retention_days: int = 30
+
+
 @dataclass
 class Settings:
     ocr_dpi: int = 300
@@ -747,6 +765,7 @@ class Settings:
     repeated_image_min_pages: int = 3
     regions: list[Region] = field(default_factory=list)
     ner: NerSettings = field(default_factory=NerSettings)
+    resource_limits: ResourceLimits = field(default_factory=ResourceLimits)
 
 
 class DenylistMatcher:
@@ -1123,6 +1142,28 @@ def load_settings(path: Path) -> Settings:
     )
     if not 0.05 <= settings.ner.threshold <= 1.0 or not 1 <= settings.ner.max_findings <= 10000:
         raise SystemExit("Configured NER review settings are outside the supported range")
+    limits_raw = raw.get("resource_limits", {})
+    if not isinstance(limits_raw, dict):
+        raise SystemExit("Sanitizer configuration could not be read")
+    settings.resource_limits = ResourceLimits(
+        max_memory_bytes=int(limits_raw.get("max_memory_bytes", ResourceLimits.max_memory_bytes)),
+        max_cpu_seconds=int(limits_raw.get("max_cpu_seconds", ResourceLimits.max_cpu_seconds)),
+        max_staging_disk_bytes=int(
+            limits_raw.get("max_staging_disk_bytes", ResourceLimits.max_staging_disk_bytes)
+        ),
+        resource_check_every_pages=int(
+            limits_raw.get("resource_check_every_pages", ResourceLimits.resource_check_every_pages)
+        ),
+        retention_days=int(limits_raw.get("retention_days", ResourceLimits.retention_days)),
+    )
+    if (
+        settings.resource_limits.max_memory_bytes <= 0
+        or settings.resource_limits.max_cpu_seconds <= 0
+        or settings.resource_limits.max_staging_disk_bytes <= 0
+        or settings.resource_limits.resource_check_every_pages <= 0
+        or settings.resource_limits.retention_days <= 0
+    ):
+        raise SystemExit("Configured resource limits are outside the supported range")
     for item in raw.get("regions", []):
         if not item.get("enabled", True):
             continue
@@ -2199,6 +2240,60 @@ def process_peak_rss_bytes() -> int:
     return peak if platform.system() == "Darwin" else peak * 1024
 
 
+def _handle_cpu_limit_signal(signum: int, frame) -> None:  # noqa: ARG001 - signal handler signature
+    """Converts a hard RLIMIT_CPU breach (SIGXCPU) into the same controlled
+    failure path as any other page-processing error, instead of the default
+    action (terminating the process)."""
+    raise PageProcessingError(0, "CPU time ceiling exceeded")
+
+
+def apply_process_resource_limits(limits: ResourceLimits) -> None:
+    """Best-effort OS-level ceilings for the whole run's process.
+
+    One Python process handles every document in a run (see orchestrate_run),
+    so these limits are process-wide, not per-document. Each limit is applied
+    independently: RLIMIT_AS/RLIMIT_RSS enforcement is inconsistent across
+    platforms (notably unenforced on macOS), so a platform that rejects one
+    limit still gets the others rather than none at all.
+    """
+    for name in ("RLIMIT_AS", "RLIMIT_RSS"):
+        limit_id = getattr(resource, name, None)
+        if limit_id is None:
+            continue
+        try:
+            resource.setrlimit(limit_id, (limits.max_memory_bytes, limits.max_memory_bytes))
+        except (ValueError, OSError):
+            continue
+        break
+    try:
+        resource.setrlimit(resource.RLIMIT_CPU, (limits.max_cpu_seconds, limits.max_cpu_seconds))
+    except (ValueError, OSError, AttributeError):
+        pass
+    try:
+        signal.signal(signal.SIGXCPU, _handle_cpu_limit_signal)
+    except (ValueError, OSError, AttributeError):
+        pass
+
+
+def check_resource_ceilings(staging_dir: Path, limits: ResourceLimits, page_number: int = 0) -> None:
+    """Polled ceiling check for memory and staging-disk usage.
+
+    Called at page boundaries during processing (see sanitize_document). A
+    breach raises the same PageProcessingError the Tesseract/Ghostscript
+    timeouts already raise, so it reaches the existing FAIL-building path in
+    orchestrate_run unchanged. Disk usage has no OS-level rlimit equivalent
+    for a directory, so it's enforced here rather than via setrlimit.
+    """
+    peak_rss = process_peak_rss_bytes()
+    if peak_rss > limits.max_memory_bytes:
+        raise PageProcessingError(page_number, "memory ceiling exceeded")
+    staging_bytes = sum(
+        entry.stat().st_size for entry in staging_dir.rglob("*") if entry.is_file()
+    )
+    if staging_bytes > limits.max_staging_disk_bytes:
+        raise PageProcessingError(page_number, "staging disk usage ceiling exceeded")
+
+
 def rendered_ocr_verification(
     doc: fitz.Document,
     denylist: DenylistMatcher,
@@ -2722,6 +2817,11 @@ def sanitize_document(
             raise PageProcessingError(page_number, "inspection or redaction failed") from exc
         if settings.progress_every_pages and page_number % settings.progress_every_pages == 0:
             print(f"{document_id}: sanitized {page_number}/{len(source_doc)} pages", file=sys.stderr)
+        if (
+            settings.resource_limits.resource_check_every_pages
+            and page_number % settings.resource_limits.resource_check_every_pages == 0
+        ):
+            check_resource_ceilings(destination.parent, settings.resource_limits, page_number)
 
     remove_interactive_content(source_doc)
     try:
@@ -2781,6 +2881,11 @@ def sanitize_document(
             raster_doc.close()
             if settings.progress_every_pages and page_number % settings.progress_every_pages == 0:
                 print(f"{document_id}: rebuilt {page_number}/{len(cleaned)} pages", file=sys.stderr)
+            if (
+                settings.resource_limits.resource_check_every_pages
+                and page_number % settings.resource_limits.resource_check_every_pages == 0
+            ):
+                check_resource_ceilings(destination.parent, settings.resource_limits, page_number)
         if vector_flattened is not None:
             vector_flattened.close()
         cleaned.close()
@@ -3108,7 +3213,44 @@ def orchestrate_run(
     write_private_text(staging_dir / "manifest.json", json.dumps(manifest, indent=2) + "\n")
     write_private_text(staging_dir / "review-summary.md", review_summary(run_id, payload, manifest))
     os.replace(staging_dir, final_dir)
+    if payload["all_automated_checks_pass"]:
+        # Confidential residual crops are only needed for triage on a run
+        # that still requires review or investigation; a fully clean run has
+        # nothing left to review, so the NDA-sensitive material is deleted
+        # rather than left to accumulate (issue #8's "light version" scope
+        # explicitly excludes cleanup on failure/crash). A real deletion
+        # failure should surface loudly rather than leave NDA material
+        # behind unnoticed, so this doesn't swallow errors the way
+        # ignore_errors=True would.
+        triage_dir = final_dir / "triage"
+        if triage_dir.exists():
+            shutil.rmtree(triage_dir)
     return final_dir, payload
+
+
+def prune_expired_runs(
+    output_root: Path, retention_days: int, *, now: dt.datetime | None = None,
+) -> list[Path]:
+    """Delete published run directories older than retention_days.
+
+    An explicit maintenance step (see tools/prune_runs.py), never run
+    automatically on every invocation. Directories whose name starts with
+    "." are a staging dir from a run that never finished publishing (crashed
+    before its atomic rename in orchestrate_run) and are left untouched —
+    startup recovery for abandoned runs is explicitly out of scope.
+    """
+    if not output_root.is_dir():
+        return []
+    cutoff = (now or dt.datetime.now(dt.timezone.utc)) - dt.timedelta(days=retention_days)
+    removed: list[Path] = []
+    for entry in sorted(output_root.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        mtime = dt.datetime.fromtimestamp(entry.stat().st_mtime, dt.timezone.utc)
+        if mtime < cutoff:
+            shutil.rmtree(entry)
+            removed.append(entry)
+    return removed
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -3153,6 +3295,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not source.is_file() or source.suffix.casefold() != ".pdf":
             raise SystemExit("An input is not a readable PDF file")
     settings = load_settings(args.config)
+    apply_process_resource_limits(settings.resource_limits)
     if settings.detect_barcodes and zxingcpp is None:
         raise SystemExit("The local barcode decoder dependency is missing")
     lexicons = load_lexicons(args.lexicons, args.allowlist)

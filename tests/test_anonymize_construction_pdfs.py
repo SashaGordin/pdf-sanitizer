@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import importlib.util
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
 import unittest
@@ -2168,6 +2170,273 @@ class VerifyExistingTest(unittest.TestCase):
             verify_existing.IndependentLine("QUANTITY VOLTAGE", 105, 100, 250, 112),
         ]
         self.assertEqual(policy.scan_lines(lines), {})
+
+
+class ResourceCeilingTest(unittest.TestCase):
+    """Ticket 02: a memory/CPU/disk ceiling breach must fail closed through
+    the same PageProcessingError path the Tesseract/Ghostscript timeouts use
+    (SanitizerTests.test_tesseract_timeout_fails_closed_per_page and
+    test_ghostscript_timeout_fails_closed_without_hanging) rather than
+    crashing or hanging. Real OS-level rlimit enforcement is platform-
+    inconsistent (notably unenforced on macOS), so breaches are forced here
+    by mocking the polled check, not by relying on the kernel to enforce it."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="resource_ceiling_test_")
+        self.root = Path(self.temp.name)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_memory_ceiling_forces_controlled_fail(self) -> None:
+        limits = sanitizer.ResourceLimits(max_memory_bytes=1)
+        with mock.patch.object(sanitizer, "process_peak_rss_bytes", return_value=10**9):
+            with self.assertRaises(sanitizer.PageProcessingError) as caught:
+                sanitizer.check_resource_ceilings(self.root, limits)
+        self.assertIn("memory", caught.exception.reason.lower())
+
+    def test_disk_ceiling_forces_controlled_fail(self) -> None:
+        (self.root / "big.bin").write_bytes(b"0" * 4096)
+        limits = sanitizer.ResourceLimits(max_staging_disk_bytes=1024)
+        with self.assertRaises(sanitizer.PageProcessingError) as caught:
+            sanitizer.check_resource_ceilings(self.root, limits)
+        self.assertIn("disk", caught.exception.reason.lower())
+
+    def test_ceilings_pass_silently_when_within_limits(self) -> None:
+        (self.root / "small.bin").write_bytes(b"0" * 16)
+        limits = sanitizer.ResourceLimits(max_memory_bytes=10**12, max_staging_disk_bytes=10**9)
+        sanitizer.check_resource_ceilings(self.root, limits)  # must not raise
+
+    def test_memory_breach_during_processing_fails_closed_per_page(self) -> None:
+        source = self.root / "source.pdf"
+        create_searchable_pdf(source)
+        destination = self.root / "sanitized_document_01.pdf"
+        settings = sanitizer.Settings(
+            ocr_dpi=220, barcode_dpi=72, min_vector_text_chars=20, progress_every_pages=0,
+            detect_barcodes=True, redact_repeated_margin_images=False,
+            resource_limits=sanitizer.ResourceLimits(max_memory_bytes=1, resource_check_every_pages=1),
+        )
+        with mock.patch.object(sanitizer, "process_peak_rss_bytes", return_value=10**9):
+            with self.assertRaises(sanitizer.PageProcessingError) as caught:
+                sanitizer.sanitize_document(
+                    source, destination, "sanitized_document_01", FAKE_TERMS, settings, self.root,
+                )
+        self.assertEqual(caught.exception.page_number, 1)
+        self.assertIn("memory", caught.exception.reason.lower())
+
+    def test_memory_breach_fails_the_run_closed_via_orchestrate_run(self) -> None:
+        # The acceptance criterion asks that "the run" fail closed, not just
+        # that sanitize_document raises — drive the real orchestrate_run
+        # path (AtomicRunPackagingTest's fixture pattern) with a real
+        # PageProcessingError from check_resource_ceilings and assert the
+        # run-level FAIL shape, matching
+        # AtomicRunPackagingTest.test_failure_still_publishes_a_failure_record.
+        source = self.root / "source.pdf"
+        source.write_bytes(b"synthetic source")
+        config = self.root / "config.json"
+        config.write_text("{}")
+        denylist = self.root / "denylist.json"
+        denylist.write_text(json.dumps({"identifiers": ["Fictional Owner Holdings"]}))
+        allowlist = self.root / "allowlist.json"
+        allowlist.write_text("{}")
+        lexicons = self.root / "lexicons"
+        lexicons.mkdir()
+        for name in sanitizer.LEXICON_FILENAMES:
+            (lexicons / name).write_text("{}")
+        output_root = self.root / "runs"
+        temp_root = self.root / "tmp"
+        temp_root.mkdir()
+
+        def breaching_sanitize(source, destination, document_id, denylist, settings, temp_root,
+                                ner_detector=None, lexicons=None):
+            sanitizer.check_resource_ceilings(destination.parent, settings.resource_limits, 1)
+            raise AssertionError("check_resource_ceilings should have raised")
+
+        settings = sanitizer.Settings(resource_limits=sanitizer.ResourceLimits(max_memory_bytes=1))
+        with (
+            mock.patch.object(sanitizer, "sanitize_document", side_effect=breaching_sanitize),
+            mock.patch.object(sanitizer, "runtime_versions", return_value={"python": "test"}),
+            mock.patch.object(sanitizer, "process_peak_rss_bytes", return_value=10**9),
+        ):
+            run_dir, payload = sanitizer.orchestrate_run(
+                sources=[source], output_root=output_root, output_index_start=1,
+                denylist={"Fictional Owner Holdings"}, settings=settings, temp_root=temp_root,
+                denylist_path=denylist, project_metadata_path=None, config_path=config,
+                allowlist_path=allowlist, lexicon_dir=lexicons, lexicons=None, ner_detector=None,
+            )
+        self.assertEqual(payload["release_status"], sanitizer.RELEASE_STATUS_FAIL)
+        self.assertFalse(payload["documents"][0]["checks"]["processing_completed"])
+        self.assertIn("memory ceiling exceeded", payload["documents"][0]["fail_reason"])
+        self.assertTrue((run_dir / "manifest.json").is_file())
+
+    def test_cpu_limit_signal_converts_to_controlled_fail(self) -> None:
+        with self.assertRaises(sanitizer.PageProcessingError) as caught:
+            sanitizer._handle_cpu_limit_signal(signal.SIGXCPU, None)
+        self.assertIn("CPU", caught.exception.reason)
+
+    def test_setrlimit_failures_on_unsupported_limits_do_not_raise(self) -> None:
+        with mock.patch.object(
+            sanitizer.resource, "setrlimit", side_effect=OSError("not supported"),
+        ):
+            sanitizer.apply_process_resource_limits(sanitizer.ResourceLimits())  # must not raise
+
+
+class RunCleanupTest(unittest.TestCase):
+    """Ticket 02: confidential triage crops are deleted once a run
+    completes successfully, and left untouched on any failure or partial
+    failure. Reuses AtomicRunPackagingTest's fixture/run pattern."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="run_cleanup_test_")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.source = self.root / "source.pdf"
+        self.source.write_bytes(b"synthetic source")
+        self.config = self.root / "config.json"
+        self.config.write_text("{}")
+        self.denylist = self.root / "denylist.json"
+        self.denylist.write_text(json.dumps({"identifiers": ["Fictional Owner Holdings"]}))
+        self.allowlist = self.root / "allowlist.json"
+        self.allowlist.write_text("{}")
+        self.lexicons = self.root / "lexicons"
+        self.lexicons.mkdir()
+        for name in sanitizer.LEXICON_FILENAMES:
+            (self.lexicons / name).write_text("{}")
+        self.output_root = self.root / "runs"
+        self.temp_root = self.root / "tmp"
+        self.temp_root.mkdir()
+
+    @staticmethod
+    def fake_sanitize_with_triage(release_status: str):
+        def fake_sanitize(source, destination, document_id, denylist, settings, temp_root,
+                           ner_detector=None, lexicons=None):
+            destination.write_bytes(b"synthetic sanitized pdf")
+            triage_dir = destination.parent / "triage" / document_id
+            triage_dir.mkdir(parents=True, exist_ok=True)
+            (triage_dir / "residual_0001_page0001_street_address.png").write_bytes(b"crop")
+            return {
+                "document_id": document_id,
+                "source_sha256": sanitizer.sha256_file(source),
+                "output_sha256": sanitizer.sha256_file(destination),
+                "pages": 1,
+                "checks": {"processing_completed": True},
+                "release_status": release_status,
+            }
+        return fake_sanitize
+
+    def run_once(self, fake_sanitize) -> tuple[Path, dict]:
+        with (
+            mock.patch.object(sanitizer, "sanitize_document", side_effect=fake_sanitize),
+            mock.patch.object(sanitizer, "runtime_versions", return_value={"python": "test"}),
+        ):
+            return sanitizer.orchestrate_run(
+                sources=[self.source], output_root=self.output_root, output_index_start=1,
+                denylist={"Fictional Owner Holdings"}, settings=sanitizer.Settings(),
+                temp_root=self.temp_root, denylist_path=self.denylist,
+                project_metadata_path=None, config_path=self.config,
+                allowlist_path=self.allowlist, lexicon_dir=self.lexicons,
+                lexicons=None, ner_detector=None,
+            )
+
+    def test_successful_run_deletes_triage_directory(self) -> None:
+        run_dir, payload = self.run_once(
+            self.fake_sanitize_with_triage(sanitizer.RELEASE_STATUS_AUTOMATED_PASS),
+        )
+        self.assertTrue(payload["all_automated_checks_pass"])
+        self.assertFalse((run_dir / "triage").exists())
+
+    def test_failed_run_leaves_triage_directory_untouched(self) -> None:
+        def raising_sanitize(source, destination, document_id, denylist, settings, temp_root,
+                              ner_detector=None, lexicons=None):
+            triage_dir = destination.parent / "triage" / document_id
+            triage_dir.mkdir(parents=True, exist_ok=True)
+            (triage_dir / "residual_0001_page0001_street_address.png").write_bytes(b"crop")
+            raise RuntimeError("boom")
+
+        run_dir, payload = self.run_once(raising_sanitize)
+        self.assertEqual(payload["release_status"], sanitizer.RELEASE_STATUS_FAIL)
+        self.assertTrue((run_dir / "triage" / "sanitized_document_01").is_dir())
+
+    def test_partial_pass_with_one_failed_document_leaves_triage_untouched(self) -> None:
+        second_source = self.root / "source2.pdf"
+        second_source.write_bytes(b"synthetic source 2")
+        statuses = iter([sanitizer.RELEASE_STATUS_AUTOMATED_PASS, sanitizer.RELEASE_STATUS_FAIL])
+
+        def mixed_sanitize(source, destination, document_id, denylist, settings, temp_root,
+                            ner_detector=None, lexicons=None):
+            destination.write_bytes(b"synthetic sanitized pdf")
+            triage_dir = destination.parent / "triage" / document_id
+            triage_dir.mkdir(parents=True, exist_ok=True)
+            (triage_dir / "residual_0001_page0001_street_address.png").write_bytes(b"crop")
+            return {
+                "document_id": document_id,
+                "source_sha256": sanitizer.sha256_file(source),
+                "output_sha256": sanitizer.sha256_file(destination),
+                "pages": 1,
+                "checks": {"processing_completed": True},
+                "release_status": next(statuses),
+            }
+
+        with (
+            mock.patch.object(sanitizer, "sanitize_document", side_effect=mixed_sanitize),
+            mock.patch.object(sanitizer, "runtime_versions", return_value={"python": "test"}),
+        ):
+            run_dir, payload = sanitizer.orchestrate_run(
+                sources=[self.source, second_source], output_root=self.output_root,
+                output_index_start=1, denylist={"Fictional Owner Holdings"},
+                settings=sanitizer.Settings(), temp_root=self.temp_root,
+                denylist_path=self.denylist, project_metadata_path=None,
+                config_path=self.config, allowlist_path=self.allowlist,
+                lexicon_dir=self.lexicons, lexicons=None, ner_detector=None,
+            )
+        self.assertFalse(payload["all_automated_checks_pass"])
+        self.assertTrue((run_dir / "triage").exists())
+
+
+class RunRetentionPruningTest(unittest.TestCase):
+    """Ticket 02: the retention-pruning maintenance step (tools/prune_runs.py)
+    deletes only run directories older than the configured window, and
+    never touches an orphaned staging directory from a crashed run (startup
+    recovery for abandoned runs is explicitly out of scope)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="run_retention_test_")
+        self.addCleanup(self.tmp.cleanup)
+        self.output_root = Path(self.tmp.name)
+
+    def _make_run_dir(self, name: str, age_days: float) -> Path:
+        run_dir = self.output_root / name
+        run_dir.mkdir(parents=True)
+        (run_dir / "report.json").write_text("{}")
+        timestamp = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=age_days)).timestamp()
+        os.utime(run_dir, (timestamp, timestamp))
+        return run_dir
+
+    def test_prune_removes_only_directories_older_than_window(self) -> None:
+        old_one = self._make_run_dir("run-old-1", age_days=40)
+        old_two = self._make_run_dir("run-old-2", age_days=10)
+        recent_one = self._make_run_dir("run-recent-1", age_days=2)
+        recent_two = self._make_run_dir("run-recent-2", age_days=0.1)
+
+        removed = sanitizer.prune_expired_runs(self.output_root, retention_days=7)
+
+        self.assertEqual(set(removed), {old_one, old_two})
+        self.assertFalse(old_one.exists())
+        self.assertFalse(old_two.exists())
+        self.assertTrue(recent_one.exists())
+        self.assertTrue(recent_two.exists())
+
+    def test_prune_ignores_staging_temp_directories(self) -> None:
+        stray_staging = self._make_run_dir(".20260101T000000.000000Z-abcd1234.tmp-xyz", age_days=40)
+
+        removed = sanitizer.prune_expired_runs(self.output_root, retention_days=7)
+
+        self.assertEqual(removed, [])
+        self.assertTrue(stray_staging.exists())
+
+    def test_prune_against_empty_output_root_returns_nothing(self) -> None:
+        empty_root = self.output_root / "does-not-exist-yet"
+        self.assertEqual(sanitizer.prune_expired_runs(empty_root, retention_days=7), [])
 
 
 if __name__ == "__main__":
