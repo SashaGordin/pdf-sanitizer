@@ -23,7 +23,9 @@
       "city"
     ],
     "threshold": 0.5,
-    "max_findings": 500
+    "max_findings": {
+      "_default": 500
+    }
   },
   "regions": [
     {
