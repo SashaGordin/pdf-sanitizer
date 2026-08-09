@@ -272,11 +272,11 @@ class SanitizerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def run_sanitizer(self, source: Path, settings=None):
+    def run_sanitizer(self, source: Path, settings=None, run_key: bytes | None = None):
         destination = self.root / "sanitized_document_01.pdf"
         report = sanitizer.sanitize_document(
             source, destination, "sanitized_document_01", FAKE_TERMS,
-            settings or self.settings, self.root,
+            settings or self.settings, self.root, run_key or os.urandom(32),
         )
         return destination, report
 
@@ -472,8 +472,9 @@ class SanitizerTests(unittest.TestCase):
         sizes = [(round(page.rect.width, 3), round(page.rect.height, 3)) for page in doc]
         doc.close()
         triage_dir = self.root / "triage" / "sanitized_document_01"
+        run_key = os.urandom(32)
         result = sanitizer.verify_output(
-            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(), triage_dir,
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(), triage_dir, run_key,
         )
         self.assertEqual(result["release_status"], sanitizer.RELEASE_STATUS_FAIL)
         residuals = result["residuals"]
@@ -483,17 +484,99 @@ class SanitizerTests(unittest.TestCase):
         self.assertIn("email", categories)
         self.assertIn("denylist", categories)
         for residual in residuals:
-            for ch in residual["shape"]:
-                if ch.isalpha():
-                    self.assertIn(ch, "Aa")
-                elif ch.isdigit():
-                    self.assertEqual(ch, "9")
+            self.assertNotIn("shape", residual)
+            digest = residual["digest"]
+            self.assertEqual(len(digest), 64)
+            self.assertTrue(all(ch in "0123456789abcdef" for ch in digest))
             crop = self.root / residual["crop"]
             self.assertTrue(crop.is_file())
             with Image.open(crop) as image:
                 self.assertGreater(image.width, 10)
-        denylist_shapes = [r["shape"] for r in residuals if r["category"] == "denylist"]
-        self.assertTrue(any("\n" in shape for shape in denylist_shapes))
+
+    def two_page_denylist_source(self) -> tuple[Path, list[tuple[float, float]]]:
+        source = self.root / "repeated.pdf"
+        pdf = canvas.Canvas(str(source), pagesize=letter)
+        for _ in range(2):
+            pdf.setFont("Helvetica", 12)
+            pdf.drawString(45, 700, "Fictional Owner Holdings")
+            pdf.showPage()
+        pdf.save()
+        doc = fitz.open(source)
+        sizes = [(round(page.rect.width, 3), round(page.rect.height, 3)) for page in doc]
+        doc.close()
+        return source, sizes
+
+    def test_repeated_value_gets_the_same_digest_within_one_run(self) -> None:
+        source, sizes = self.two_page_denylist_source()
+        run_key = os.urandom(32)
+        result = sanitizer.verify_output(
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(),
+            self.root / "triage" / "sanitized_document_01", run_key,
+        )
+        residuals = [r for r in result["residuals"] if r["category"] == "denylist"]
+        self.assertEqual(len(residuals), 2)
+        self.assertEqual(residuals[0]["digest"], residuals[1]["digest"])
+
+    def test_same_value_gets_a_different_digest_across_runs(self) -> None:
+        source, sizes = self.two_page_denylist_source()
+        triage_dir = self.root / "triage" / "sanitized_document_01"
+        first = sanitizer.verify_output(
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(), triage_dir, os.urandom(32),
+        )
+        second = sanitizer.verify_output(
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(), triage_dir, os.urandom(32),
+        )
+        first_digest = next(r["digest"] for r in first["residuals"] if r["category"] == "denylist")
+        second_digest = next(r["digest"] for r in second["residuals"] if r["category"] == "denylist")
+        self.assertNotEqual(first_digest, second_digest)
+
+    def test_digest_cannot_be_narrowed_down_without_the_run_key(self) -> None:
+        # masked_shape() leaks a value's length and character classes even
+        # without the run key: a report + output PDF pair let an attacker
+        # match distinctive shapes against surrounding text. keyed_digest()
+        # must not have that property — the digest for a guessed value only
+        # matches the report's digest if the guesser also has the run key.
+        source, sizes = self.two_page_denylist_source()
+        run_key = os.urandom(32)
+        result = sanitizer.verify_output(
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(),
+            self.root / "triage" / "sanitized_document_01", run_key,
+        )
+        report_digest = next(r["digest"] for r in result["residuals"] if r["category"] == "denylist")
+        self.assertEqual(report_digest, sanitizer.keyed_digest(run_key, "Fictional Owner Holdings"))
+        for guessed_key in (b"\x00" * 32, b"\xff" * 32, os.urandom(32), os.urandom(32)):
+            self.assertNotEqual(
+                report_digest, sanitizer.keyed_digest(guessed_key, "Fictional Owner Holdings"),
+            )
+
+    def test_digest_hides_length_and_character_class_unlike_masked_shape(self) -> None:
+        # masked_shape()'s length equals the original value's length and its
+        # character classes (letters vs digits) mirror the original, so
+        # shape length/composition alone narrows candidates when matched
+        # against surrounding output text. keyed_digest() must not carry
+        # that signal: values of very different length and composition
+        # collapse to the same fixed-length hex digest.
+        short_value = "ZX-FAKE-2048"
+        long_value = "Fabricated Engineering Group of North America, LLC"
+        self.assertNotEqual(len(short_value), len(long_value))
+        self.assertNotEqual(
+            len(sanitizer.masked_shape(short_value)), len(sanitizer.masked_shape(long_value)),
+        )
+        run_key = os.urandom(32)
+        short_digest = sanitizer.keyed_digest(run_key, short_value)
+        long_digest = sanitizer.keyed_digest(run_key, long_value)
+        self.assertEqual(len(short_digest), len(long_digest))
+        self.assertNotEqual(short_digest, long_digest)
+
+    def test_masked_shape_output_never_appears_in_the_serialized_report(self) -> None:
+        source, sizes = self.two_page_denylist_source()
+        result = sanitizer.verify_output(
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(),
+            self.root / "triage" / "sanitized_document_01", os.urandom(32),
+        )
+        serialized = json.dumps(result)
+        self.assertNotIn('"shape"', serialized)
+        self.assertNotIn(sanitizer.masked_shape("Fictional Owner Holdings"), serialized)
 
     def test_cross_block_page_stream_artifact_is_not_flagged(self) -> None:
         # Two far-apart blocks whose concatenation in the old whole-page text
@@ -628,7 +711,7 @@ class SanitizerTests(unittest.TestCase):
             return results
         return predict
 
-    def test_ner_review_is_report_only_with_masked_findings_and_crops(self) -> None:
+    def test_ner_review_is_report_only_with_keyed_findings_and_crops(self) -> None:
         source = self.root / "unlisted.pdf"
         pdf = canvas.Canvas(str(source), pagesize=letter)
         pdf.setFont("Helvetica", 12)
@@ -646,7 +729,7 @@ class SanitizerTests(unittest.TestCase):
         destination = self.root / "sanitized_document_01.pdf"
         report = sanitizer.sanitize_document(
             source, destination, "sanitized_document_01", FAKE_TERMS,
-            self.settings, self.root, ner_detector=detector,
+            self.settings, self.root, os.urandom(32), ner_detector=detector,
         )
         # Report-only: findings never change the verdict or the checks.
         self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
@@ -661,11 +744,9 @@ class SanitizerTests(unittest.TestCase):
         self.assertEqual(finding["occurrences"], 1)
         self.assertEqual(finding["label"], "company name")
         self.assertAlmostEqual(finding["score_max"], 0.91)
-        for ch in finding["shape"]:
-            if ch.isalpha():
-                self.assertIn(ch, "Aa")
-            elif ch.isdigit():
-                self.assertEqual(ch, "9")
+        self.assertNotIn("shape", finding)
+        self.assertEqual(len(finding["digest"]), 64)
+        self.assertTrue(all(ch in "0123456789abcdef" for ch in finding["digest"]))
         crop = self.root / finding["crop"]
         self.assertTrue(crop.is_file())
         with Image.open(crop) as image:
@@ -708,7 +789,7 @@ class SanitizerTests(unittest.TestCase):
         )
         result = sanitizer.verify_output(
             source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(),
-            self.root / "triage" / "sanitized_document_01", ner_detector=detector,
+            self.root / "triage" / "sanitized_document_01", os.urandom(32), ner_detector=detector,
         )
         review = result["ner_review"]
         # Two occurrences, each span deduped to the higher-scored label...
@@ -725,9 +806,64 @@ class SanitizerTests(unittest.TestCase):
         # The NER layer is absent from reports when no detector is supplied.
         without = sanitizer.verify_output(
             source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(),
-            self.root / "triage" / "sanitized_document_01",
+            self.root / "triage" / "sanitized_document_01", os.urandom(32),
         )
         self.assertNotIn("ner_review", without)
+
+    def test_findings_tie_break_order_is_stable_across_runs(self) -> None:
+        # Two distinct findings tied on occurrences and label. The sort's
+        # tie-break must not depend on the digest (keyed by a fresh random
+        # secret each run) or the same document would order its findings
+        # differently from run to run for no reason tied to its content.
+        source = self.root / "two_unlisted_firms.pdf"
+        pdf = canvas.Canvas(str(source), pagesize=letter)
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(45, 700, "Alpha Fictitious Builders shall coordinate with field staff")
+        pdf.drawString(45, 660, "Zeta Imaginary Contractors retains record documents")
+        pdf.showPage()
+        pdf.save()
+        doc = fitz.open(source)
+        sizes = [(round(page.rect.width, 3), round(page.rect.height, 3)) for page in doc]
+        doc.close()
+
+        def two_firm_predict(texts, labels, threshold):
+            results = []
+            for text in texts:
+                entities = []
+                for target in ("Alpha Fictitious Builders", "Zeta Imaginary Contractors"):
+                    found = text.find(target)
+                    if found >= 0:
+                        entities.append({
+                            "start": found, "end": found + len(target),
+                            "label": "company name", "score": 0.7,
+                        })
+                results.append(entities)
+            return results
+
+        detector = sanitizer.NerDetector(two_firm_predict, ("company name",), 0.5, "stub-model")
+        triage_dir = self.root / "triage" / "sanitized_document_01"
+
+        # Spy on keyed_digest to learn, for this test only, which original
+        # text produced which digest — the report itself never carries this
+        # mapping. This lets the test verify the sort order follows the
+        # deterministic surface form, not the random per-run digest.
+        real_keyed_digest = sanitizer.keyed_digest
+        digest_to_text: dict[str, str] = {}
+
+        def spy_keyed_digest(key: bytes, value: str) -> str:
+            digest = real_keyed_digest(key, value)
+            digest_to_text[digest] = value
+            return digest
+
+        with mock.patch.object(sanitizer, "keyed_digest", side_effect=spy_keyed_digest):
+            result = sanitizer.verify_output(
+                source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(), triage_dir, os.urandom(32),
+                ner_detector=detector,
+            )
+        findings = result["ner_review"]["findings"]
+        self.assertEqual(len(findings), 2)
+        texts_in_order = [digest_to_text[f["digest"]] for f in findings]
+        self.assertEqual(texts_in_order, sorted(texts_in_order, key=str.casefold))
 
     def test_review_report_serializes_without_sensitive_values(self) -> None:
         source = self.root / "source.pdf"
@@ -990,7 +1126,7 @@ class FilePathPatternTest(unittest.TestCase):
         pdf.save()
         sanitizer.sanitize_document(
             source, root / "out.pdf", "sanitized_document_01",
-            FAKE_TERMS, sanitizer.Settings(), root,
+            FAKE_TERMS, sanitizer.Settings(), root, os.urandom(32),
             lexicons=sanitizer.load_lexicons(REPO_LEXICONS, REPO_ALLOWLIST),
         )
         output = fitz.open(root / "out.pdf")
@@ -1097,7 +1233,7 @@ class SuppressionSymmetryTest(unittest.TestCase):
         source = self.build()
         return sanitizer.sanitize_document(
             source, self.root / "out.pdf", "sanitized_document_01",
-            FAKE_TERMS, self.settings, self.root, lexicons=lexicons,
+            FAKE_TERMS, self.settings, self.root, os.urandom(32), lexicons=lexicons,
         )
 
     def test_schedule_cells_survive_and_the_run_still_passes(self) -> None:
@@ -1307,7 +1443,7 @@ class BuildRunPayloadTest(unittest.TestCase):
         reports = [{"release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS}]
         payload = sanitizer.build_run_payload(reports, self.FAKE_FINGERPRINT, ner_enabled=False)
         self.assertEqual(payload["fingerprint"], self.FAKE_FINGERPRINT)
-        self.assertEqual(payload["schema_version"], 3)
+        self.assertEqual(payload["schema_version"], 4)
         self.assertTrue(payload["all_automated_checks_pass"])
         self.assertEqual(payload["release_status"], sanitizer.RELEASE_STATUS_REVIEW_REQUIRED)
         self.assertFalse(any("NER" in note for note in payload["notes"]))
@@ -1416,7 +1552,7 @@ class RasterVectorParityTest(unittest.TestCase):
     def run_on(self, source: Path) -> tuple[dict, str]:
         destination = self.root / f"{source.stem}_out.pdf"
         report = sanitizer.sanitize_document(
-            source, destination, source.stem, FAKE_TERMS, self.settings, self.root,
+            source, destination, source.stem, FAKE_TERMS, self.settings, self.root, os.urandom(32),
             lexicons=self.lex,
         )
         output = fitz.open(destination)
@@ -1500,7 +1636,7 @@ class MixedPageRasterTest(unittest.TestCase):
 
         destination = self.root / "out.pdf"
         report = sanitizer.sanitize_document(
-            source, destination, "doc", FAKE_TERMS, self.settings, self.root,
+            source, destination, "doc", FAKE_TERMS, self.settings, self.root, os.urandom(32),
             lexicons=self.lex,
         )
         self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
@@ -1562,7 +1698,7 @@ class RasterFailureContainmentTest(unittest.TestCase):
         with mock.patch.object(sanitizer, "ocr_detection_boxes", side_effect=fake_ocr_detection_boxes):
             destination = self.root / "out.pdf"
             report = sanitizer.sanitize_document(
-                source, destination, "doc", FAKE_TERMS, self.settings, self.root,
+                source, destination, "doc", FAKE_TERMS, self.settings, self.root, os.urandom(32),
             )
 
         self.assertEqual(
@@ -1617,7 +1753,7 @@ class ArchitectOfRecordTest(unittest.TestCase):
         destination = self.root / "out.pdf"
         lex = sanitizer.load_lexicons(REPO_LEXICONS, REPO_ALLOWLIST)
         report = sanitizer.sanitize_document(
-            source, destination, "doc", FAKE_TERMS, self.settings, self.root,
+            source, destination, "doc", FAKE_TERMS, self.settings, self.root, os.urandom(32),
             lexicons=lex,
         )
         self.assertIn(1, report["rasterized_pages"])
@@ -1654,7 +1790,7 @@ class AtomicRunPackagingTest(unittest.TestCase):
         self.temp_root.mkdir()
 
     @staticmethod
-    def fake_sanitize(source, destination, document_id, denylist, settings, temp_root,
+    def fake_sanitize(source, destination, document_id, denylist, settings, temp_root, run_key,
                       ner_detector=None, lexicons=None):
         destination.write_bytes(b"synthetic sanitized pdf")
         return {
@@ -1715,6 +1851,26 @@ class AtomicRunPackagingTest(unittest.TestCase):
             "status": "not_started", "reviewer": None, "completed_at": None,
         })
 
+    def test_run_key_is_never_written_to_disk(self) -> None:
+        known_key = b"\x01" * 32
+        with (
+            mock.patch.object(sanitizer, "sanitize_document", side_effect=self.fake_sanitize),
+            mock.patch.object(sanitizer, "runtime_versions", return_value={"python": "test"}),
+            mock.patch.object(sanitizer.secrets, "token_bytes", return_value=known_key),
+        ):
+            run_dir, _ = sanitizer.orchestrate_run(
+                sources=[self.source], output_root=self.output_root, output_index_start=1,
+                denylist={"Fictional Owner Holdings"}, settings=sanitizer.Settings(),
+                temp_root=self.temp_root, denylist_path=self.denylist,
+                project_metadata_path=None, config_path=self.config,
+                allowlist_path=self.allowlist, lexicon_dir=self.lexicons,
+                lexicons=None, ner_detector=None,
+            )
+        for name in ("report.json", "manifest.json", "review-summary.md"):
+            contents = (run_dir / name).read_bytes()
+            self.assertNotIn(known_key, contents)
+            self.assertNotIn(known_key.hex().encode(), contents)
+
     def test_failure_still_publishes_a_failure_record(self) -> None:
         with (
             mock.patch.object(sanitizer, "sanitize_document", side_effect=RuntimeError("boom")),
@@ -1771,7 +1927,7 @@ class RenderedPageOcrVerifierTest(unittest.TestCase):
             return sanitizer.verify_output(
                 path, [(612.0, 792.0)] * len(fitz.open(path)),
                 sanitizer.DenylistMatcher({"Fictional Owner Holdings"}), set(),
-                self.root / "triage", settings=self.settings,
+                self.root / "triage", os.urandom(32), settings=self.settings,
                 lexicons=sanitizer.load_lexicons(REPO_LEXICONS, REPO_ALLOWLIST),
             )
 

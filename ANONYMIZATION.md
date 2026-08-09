@@ -105,13 +105,13 @@ Each invocation publishes one immutable directory under `output/runs/<run_id>/`.
 It contains the sanitized PDF(s), `report.json`, `manifest.json`, and
 `review-summary.md`; the directory appears only after all four have been
 written. A rerun always creates a new run ID. The local JSON report contains
-only hashes, counts, page numbers, redaction categories, and masked residual
-shapes (letters become A/a, digits become 9).
-
-> Report hygiene caveat: `masked_shape` is a strict one-to-one character map,
-> so a report held *alongside its output PDF* can have distinctive long spans
-> reconstructed by matching shapes against the output text. Treat the entire
-> run directory as sensitive and do not share it as an audit bundle.
+only hashes, counts, page numbers, redaction categories, and keyed digests of
+each residual/finding value. The digest is HMAC-SHA256 under a random
+256-bit key generated fresh for that run and held only in memory — it is
+never written to the report, manifest, or any other artifact — so repeated
+occurrences of the same value correlate within one run's report, but the
+digest is neither reproducible across runs nor reversible to the original
+value without the (discarded) key.
 
 Edit `config/sanitizer.json` to enable normalized `[x0, y0, x1, y1]`
 rectangles for known cover, title-block, revision, seal, logo, or approval
@@ -305,7 +305,7 @@ means open the page and look.
 ## Residual triage
 
 When automated checks fail, the report lists each residual with its page,
-category, and masked shape, and `<run_id>/triage/<document_id>/` contains a
+category, and keyed digest, and `<run_id>/triage/<document_id>/` contains a
 cropped PNG of the match region with the matched lines outlined in red. Crops
 are rendered locally and contain original page content: treat them as
 NDA-protected source material, never upload or share them, and delete the
