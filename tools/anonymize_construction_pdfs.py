@@ -3314,18 +3314,6 @@ def orchestrate_run(
     write_private_text(staging_dir / "manifest.json", json.dumps(manifest, indent=2) + "\n")
     write_private_text(staging_dir / "review-summary.md", review_summary(run_id, payload, manifest))
     os.replace(staging_dir, final_dir)
-    if payload["all_automated_checks_pass"]:
-        # Confidential residual crops are only needed for triage on a run
-        # that still requires review or investigation; a fully clean run has
-        # nothing left to review, so the NDA-sensitive material is deleted
-        # rather than left to accumulate (issue #8's "light version" scope
-        # explicitly excludes cleanup on failure/crash). A real deletion
-        # failure should surface loudly rather than leave NDA material
-        # behind unnoticed, so this doesn't swallow errors the way
-        # ignore_errors=True would.
-        triage_dir = final_dir / "triage"
-        if triage_dir.exists():
-            shutil.rmtree(triage_dir)
     return final_dir, payload
 
 
@@ -3351,6 +3339,39 @@ def prune_expired_runs(
         if mtime < cutoff:
             shutil.rmtree(entry)
             removed.append(entry)
+    return removed
+
+
+def prune_reviewed_triage(output_root: Path) -> list[Path]:
+    """Delete a published run's triage/ directory once a human has
+    completed review (manifest.review.status == "complete").
+
+    An explicit maintenance step (see tools/prune_runs.py), never run
+    automatically on every invocation — mirrors prune_expired_runs()'s
+    design. Confidential residual crops are NDA material that must survive
+    until a human reviewer has actually looked at them (issue #32); a run
+    with no manifest.json, an unreadable manifest.json, or no triage/
+    directory is skipped rather than treated as an error.
+    """
+    if not output_root.is_dir():
+        return []
+    removed: list[Path] = []
+    for entry in sorted(output_root.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        manifest_path = entry / "manifest.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if manifest.get("review", {}).get("status") != "complete":
+            continue
+        triage_dir = entry / "triage"
+        if triage_dir.exists():
+            shutil.rmtree(triage_dir)
+            removed.append(triage_dir)
     return removed
 
 

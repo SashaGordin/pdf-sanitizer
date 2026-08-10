@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Delete published run directories older than a configured retention window.
+"""Delete published run directories older than a configured retention window,
+and delete any reviewed run's triage/ crop directory.
 
 An explicit maintenance step, never run automatically by a normal sanitizer
 invocation. Startup recovery for abandoned/crashed runs (staging directories
@@ -45,6 +46,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"removed {path}", file=sys.stderr)
     print(f"pruned {len(removed)} run director{'y' if len(removed) == 1 else 'ies'} "
           f"older than {args.retention_days} day(s)", file=sys.stderr)
+
+    reviewed_triage_removed = sanitizer.prune_reviewed_triage(args.output_dir)
+    if reviewed_triage_removed:
+        for path in reviewed_triage_removed:
+            print(f"removed {path}", file=sys.stderr)
+    print(f"pruned {len(reviewed_triage_removed)} reviewed triage director"
+          f"{'y' if len(reviewed_triage_removed) == 1 else 'ies'}", file=sys.stderr)
     return 0
 
 
