@@ -62,6 +62,17 @@ case-insensitive), not fuzzy.
 
 `--project-metadata` and `--denylist` merge when both are supplied.
 
+**Intake completeness.** Every run records which of the project-metadata
+fields (`project_name`, `project_number`, `project_address`, `site_address`,
+`owner`, `architect`, `engineers`, `contractors`, `consultants`, `personnel`,
+`other_identifiers`) were missing or blank in `manifest.json`'s `intake`
+object, and hashes the supplied file into
+`manifest.json`'s `fingerprint.project_metadata_sha256`. A run with no
+`--project-metadata` at all is treated as every field empty. An empty-field
+list with no waiver blocks the run from ever reaching `RELEASED` (see
+"Mandatory human release gate" below); pass `--intake-waiver "<reason>"` to
+record an explicit, audited exception instead.
+
 ### 2. Catch what intake missed (proposal pass)
 
 `--propose-denylist` scans the sources for labelled fields and firm-name
@@ -105,13 +116,13 @@ Each invocation publishes one immutable directory under `output/runs/<run_id>/`.
 It contains the sanitized PDF(s), `report.json`, `manifest.json`, and
 `review-summary.md`; the directory appears only after all four have been
 written. A rerun always creates a new run ID. The local JSON report contains
-only hashes, counts, page numbers, redaction categories, and masked residual
-shapes (letters become A/a, digits become 9).
-
-> Report hygiene caveat: `masked_shape` is a strict one-to-one character map,
-> so a report held *alongside its output PDF* can have distinctive long spans
-> reconstructed by matching shapes against the output text. Treat the entire
-> run directory as sensitive and do not share it as an audit bundle.
+only hashes, counts, page numbers, redaction categories, and keyed digests of
+each residual/finding value. The digest is HMAC-SHA256 under a random
+256-bit key generated fresh for that run and held only in memory — it is
+never written to the report, manifest, or any other artifact — so repeated
+occurrences of the same value correlate within one run's report, but the
+digest is neither reproducible across runs nor reversible to the original
+value without the (discarded) key.
 
 Edit `config/sanitizer.json` to enable normalized `[x0, y0, x1, y1]`
 rectangles for known cover, title-block, revision, seal, logo, or approval
@@ -150,8 +161,11 @@ unlisted party name actually hides, was never shown to anyone. Each entry is
 now one `(label, surface form)` pair carrying `occurrences`, the pages it
 appears on, `score_max`, its CSI `zone`, and any manufacturer-context
 `evidence`. `finding_counts` still reports total occurrences per label;
-`distinct_form_counts` reports the number of decisions. `max_findings` now caps
-distinct forms, so the cap spans the whole document.
+`distinct_form_counts` reports the number of decisions. `max_findings` caps
+distinct forms per label (a `{"_default": 500, ...}` dict in
+`config/sanitizer.json`'s `ner` block), so the cap spans the whole document
+but a high-volume label like `organization` can no longer crowd a low-volume,
+high-value one like `street address` out of its own budget.
 
 Note what this layer can and cannot do. GLiNER answers a *type* question —
 "is this span an organization?" — and it answers correctly: Cooper Lighting is
@@ -305,7 +319,7 @@ means open the page and look.
 ## Residual triage
 
 When automated checks fail, the report lists each residual with its page,
-category, and masked shape, and `<run_id>/triage/<document_id>/` contains a
+category, and keyed digest, and `<run_id>/triage/<document_id>/` contains a
 cropped PNG of the match region with the matched lines outlined in red. Crops
 are rendered locally and contain original page content: treat them as
 NDA-protected source material, never upload or share them, and delete the
@@ -328,7 +342,14 @@ Release checklist:
 3. `tools/eval_sanitizer.py` shows recall 100% and over-redaction 0%.
 4. The `ner_review` queue has been triaged and anything genuine has been added
    to the denylist and the document re-run.
-5. Full visual review at readable zoom, by an NDA-authorized reviewer.
-6. The reviewed file's SHA-256 matches the output SHA-256 in `manifest.json`.
+5. No document's `residuals_truncated` or `ner_review.findings_truncated` is
+   nonzero, and `manifest.json`'s `intake.empty_fields` is empty or its
+   `intake.waiver` is recorded. Nothing in this tool currently re-derives
+   `release_status` after a human records review completion, so this step is
+   itself part of the manual checklist for now — but if that wiring is added
+   later, `derive_release_status()` already refuses `RELEASED` when either
+   condition fails, however "complete" the review is marked.
+6. Full visual review at readable zoom, by an NDA-authorized reviewer.
+7. The reviewed file's SHA-256 matches the output SHA-256 in `manifest.json`.
 
-Steps 1–4 are necessary and jointly insufficient. Step 5 is the gate.
+Steps 1–5 are necessary and jointly insufficient. Step 6 is the gate.

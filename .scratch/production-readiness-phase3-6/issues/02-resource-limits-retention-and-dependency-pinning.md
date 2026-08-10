@@ -47,3 +47,13 @@ issue #8's "apply now, light version" list:
       with no unexpected drift.
 
 ## Comments
+
+Flagged while building ticket 06 (real reviewer tool): "on a run's
+successful completion" cleanup, as scoped above, deletes the triage-crop
+directory at pipeline completion — before a human ever gets to review it.
+`build_run_payload()`'s own report note already says crops should be
+"delete[d] after review," which only makes sense if this cleanup keys off
+`manifest.review.status == "complete"` rather than pipeline completion.
+Whoever implements this ticket should gate triage-crop deletion on review
+completion, not run completion, or ticket 06's reviewer tool will have
+nothing left to serve.

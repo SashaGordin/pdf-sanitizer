@@ -20,22 +20,36 @@ three — no further design ticket was needed.
 
 **Blocked by:** none.
 
-**Status:** ready-for-agent
+**Status:** done
 
 **GitHub issue:** https://github.com/SashaGordin/pdf-sanitizer/issues/20
 
-- [ ] A synthetic document with a high-volume label (e.g. many `organization`
+- [x] A synthetic document with a high-volume label (e.g. many `organization`
       matches) and a low-volume high-value label (e.g. one `street address`)
       proves the low-volume label is never dropped due to the cap, with caps
       configurable per label.
-- [ ] A synthetic run forced to truncate residuals or NER findings fails to
+- [x] A synthetic run forced to truncate residuals or NER findings fails to
       reach `RELEASED`, and the report clearly states why.
-- [ ] A run with no `--project-metadata` argument fails the intake-
+- [x] A run with no `--project-metadata` argument fails the intake-
       completeness gate (or, if a waiver flag is passed, records the waiver
       and the specific empty-field list in the manifest).
-- [ ] A run with a `--project-metadata` file that has some empty fields
+- [x] A run with a `--project-metadata` file that has some empty fields
       records exactly those empty fields in the manifest.
-- [ ] The project-metadata file's hash appears in the manifest for every run
+- [x] The project-metadata file's hash appears in the manifest for every run
       that supplies one.
 
 ## Comments
+
+- Closed: `max_findings` is now a per-label `dict[str, int]` (with a
+  `"_default"` fallback) on `NerSettings`/`NerDetector`, gated per-label in
+  `verify_output()`. `derive_release_status()` gained
+  `incompleteness_reasons`, fed by a new `truncation_incompleteness_reasons()`
+  helper plus intake-gate output, both blocking `RELEASED` (not the CLI
+  process — see the plan file's "Design decisions worth flagging" for why)
+  while leaving `AUTOMATED_PASS`/`REVIEW_REQUIRED` runs unaffected. Intake
+  completeness is a new `intake_empty_fields()` function plus a
+  `--intake-waiver` CLI flag, recorded as `manifest["intake"]`
+  (`project_metadata_supplied`/`empty_fields`/`waiver`); the file's hash was
+  already flowing into `manifest["fingerprint"]["project_metadata_sha256"]`
+  before this ticket. Full suite green (97 tests) and
+  `tools/eval_sanitizer.py` unaffected (RECALL 100%, OVER-REDACTION 0%).

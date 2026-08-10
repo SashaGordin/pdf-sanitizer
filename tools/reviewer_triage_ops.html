@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Promotion preview (ops only)</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    margin: 0; padding: 0;
+    background: #eee; color: #1c1c1c;
+  }
+  #app { max-width: 800px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 20px; margin: 0 0 4px 0; }
+  h2 { font-size: 15px; margin: 24px 0 8px 0; }
+  .banner {
+    margin-bottom: 18px; padding: 12px 14px; background: #fff3cd; border: 1px solid #ffe08a;
+    border-radius: 6px; font-size: 13px; color: #6b4c00;
+  }
+  .list { background: #fff; border: 1px solid #ddd; border-radius: 6px; overflow: hidden; }
+  .list .row { padding: 10px 14px; border-bottom: 1px solid #eee; font-size: 14px; }
+  .list .row:last-child { border-bottom: none; }
+  .list .empty { padding: 14px; color: #888; font-size: 13px; }
+  .category { color: #888; font-size: 12px; }
+  .loading { color: #666; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="app"><div class="loading">Loading preview…</div></div>
+
+<script>
+"use strict";
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function renderList(items) {
+  const list = document.createElement("div");
+  list.className = "list";
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "Nothing proposed yet.";
+    list.appendChild(empty);
+    return list;
+  }
+  items.forEach(item => {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `${escapeHtml(item.shape)} <span class="category">(${escapeHtml(item.category)})</span>`;
+    list.appendChild(row);
+  });
+  return list;
+}
+
+async function load() {
+  const response = await fetch("/api/ops/preview");
+  const preview = await response.json();
+
+  const root = document.getElementById("app");
+  root.innerHTML = "";
+
+  const h = document.createElement("h1");
+  h.textContent = "Promotion preview";
+  root.appendChild(h);
+
+  const banner = document.createElement("div");
+  banner.className = "banner";
+  banner.textContent = "Preview only — nothing here has been applied. Adding any of these to " +
+    "config/denylist.local.json or a lexicon file is a separate, deliberate action.";
+  root.appendChild(banner);
+
+  const denylistHeading = document.createElement("h2");
+  denylistHeading.textContent = `Would propose adding to the denylist (${preview.denylist_additions.length})`;
+  root.appendChild(denylistHeading);
+  root.appendChild(renderList(preview.denylist_additions));
+
+  const lexiconHeading = document.createElement("h2");
+  lexiconHeading.textContent = `Would propose as a scoped lexicon rule (${preview.lexicon_proposals.length})`;
+  root.appendChild(lexiconHeading);
+  root.appendChild(renderList(preview.lexicon_proposals));
+}
+
+load();
+</script>
+</body>
+</html>

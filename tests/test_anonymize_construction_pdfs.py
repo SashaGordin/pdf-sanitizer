@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import importlib.util
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
 import unittest
@@ -12,6 +14,10 @@ from pathlib import Path
 from unittest import mock
 
 import subprocess
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import fitz
 from PIL import Image
@@ -36,6 +42,13 @@ verify_existing = importlib.util.module_from_spec(VERIFY_SPEC)
 assert VERIFY_SPEC and VERIFY_SPEC.loader
 sys.modules[VERIFY_SPEC.name] = verify_existing
 VERIFY_SPEC.loader.exec_module(verify_existing)
+
+REVIEWER_MODULE_PATH = Path(__file__).parents[1] / "tools" / "reviewer_triage.py"
+REVIEWER_SPEC = importlib.util.spec_from_file_location("reviewer_triage", REVIEWER_MODULE_PATH)
+reviewer_triage = importlib.util.module_from_spec(REVIEWER_SPEC)
+assert REVIEWER_SPEC and REVIEWER_SPEC.loader
+sys.modules[REVIEWER_SPEC.name] = reviewer_triage
+REVIEWER_SPEC.loader.exec_module(reviewer_triage)
 
 
 FAKE_TERMS = {
@@ -272,11 +285,11 @@ class SanitizerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def run_sanitizer(self, source: Path, settings=None):
+    def run_sanitizer(self, source: Path, settings=None, run_key: bytes | None = None):
         destination = self.root / "sanitized_document_01.pdf"
         report = sanitizer.sanitize_document(
             source, destination, "sanitized_document_01", FAKE_TERMS,
-            settings or self.settings, self.root,
+            settings or self.settings, self.root, run_key or os.urandom(32),
         )
         return destination, report
 
@@ -423,6 +436,19 @@ class SanitizerTests(unittest.TestCase):
         self.assertEqual(sanitizer.derive_release_status(AP, {}), RR)
         self.assertEqual(sanitizer.derive_release_status(AP, {"status": "incomplete"}), RI)
         self.assertEqual(sanitizer.derive_release_status(AP, {"status": "complete"}), R)
+        # A truncated residual/NER review list (or an unresolved intake gate)
+        # is the same kind of incompleteness signal as an unfinished review:
+        # it blocks RELEASED even once a human has signed off as "complete".
+        self.assertEqual(
+            sanitizer.derive_release_status(AP, {"status": "complete"}, incompleteness_reasons=["x"]), RI,
+        )
+        # Irrelevant when the run would not have reached RELEASED anyway.
+        self.assertEqual(
+            sanitizer.derive_release_status(AP, incompleteness_reasons=["x"]), RR,
+        )
+        self.assertEqual(
+            sanitizer.derive_release_status(F, {"status": "complete"}, incompleteness_reasons=["x"]), F,
+        )
 
     def test_denylist_matches_terms_wrapped_across_lines(self) -> None:
         matcher = sanitizer.DenylistMatcher({"Fictional Owner Holdings"})
@@ -472,8 +498,9 @@ class SanitizerTests(unittest.TestCase):
         sizes = [(round(page.rect.width, 3), round(page.rect.height, 3)) for page in doc]
         doc.close()
         triage_dir = self.root / "triage" / "sanitized_document_01"
+        run_key = os.urandom(32)
         result = sanitizer.verify_output(
-            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(), triage_dir,
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(), triage_dir, run_key,
         )
         self.assertEqual(result["release_status"], sanitizer.RELEASE_STATUS_FAIL)
         residuals = result["residuals"]
@@ -483,17 +510,99 @@ class SanitizerTests(unittest.TestCase):
         self.assertIn("email", categories)
         self.assertIn("denylist", categories)
         for residual in residuals:
-            for ch in residual["shape"]:
-                if ch.isalpha():
-                    self.assertIn(ch, "Aa")
-                elif ch.isdigit():
-                    self.assertEqual(ch, "9")
+            self.assertNotIn("shape", residual)
+            digest = residual["digest"]
+            self.assertEqual(len(digest), 64)
+            self.assertTrue(all(ch in "0123456789abcdef" for ch in digest))
             crop = self.root / residual["crop"]
             self.assertTrue(crop.is_file())
             with Image.open(crop) as image:
                 self.assertGreater(image.width, 10)
-        denylist_shapes = [r["shape"] for r in residuals if r["category"] == "denylist"]
-        self.assertTrue(any("\n" in shape for shape in denylist_shapes))
+
+    def two_page_denylist_source(self) -> tuple[Path, list[tuple[float, float]]]:
+        source = self.root / "repeated.pdf"
+        pdf = canvas.Canvas(str(source), pagesize=letter)
+        for _ in range(2):
+            pdf.setFont("Helvetica", 12)
+            pdf.drawString(45, 700, "Fictional Owner Holdings")
+            pdf.showPage()
+        pdf.save()
+        doc = fitz.open(source)
+        sizes = [(round(page.rect.width, 3), round(page.rect.height, 3)) for page in doc]
+        doc.close()
+        return source, sizes
+
+    def test_repeated_value_gets_the_same_digest_within_one_run(self) -> None:
+        source, sizes = self.two_page_denylist_source()
+        run_key = os.urandom(32)
+        result = sanitizer.verify_output(
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(),
+            self.root / "triage" / "sanitized_document_01", run_key,
+        )
+        residuals = [r for r in result["residuals"] if r["category"] == "denylist"]
+        self.assertEqual(len(residuals), 2)
+        self.assertEqual(residuals[0]["digest"], residuals[1]["digest"])
+
+    def test_same_value_gets_a_different_digest_across_runs(self) -> None:
+        source, sizes = self.two_page_denylist_source()
+        triage_dir = self.root / "triage" / "sanitized_document_01"
+        first = sanitizer.verify_output(
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(), triage_dir, os.urandom(32),
+        )
+        second = sanitizer.verify_output(
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(), triage_dir, os.urandom(32),
+        )
+        first_digest = next(r["digest"] for r in first["residuals"] if r["category"] == "denylist")
+        second_digest = next(r["digest"] for r in second["residuals"] if r["category"] == "denylist")
+        self.assertNotEqual(first_digest, second_digest)
+
+    def test_digest_cannot_be_narrowed_down_without_the_run_key(self) -> None:
+        # masked_shape() leaks a value's length and character classes even
+        # without the run key: a report + output PDF pair let an attacker
+        # match distinctive shapes against surrounding text. keyed_digest()
+        # must not have that property — the digest for a guessed value only
+        # matches the report's digest if the guesser also has the run key.
+        source, sizes = self.two_page_denylist_source()
+        run_key = os.urandom(32)
+        result = sanitizer.verify_output(
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(),
+            self.root / "triage" / "sanitized_document_01", run_key,
+        )
+        report_digest = next(r["digest"] for r in result["residuals"] if r["category"] == "denylist")
+        self.assertEqual(report_digest, sanitizer.keyed_digest(run_key, "Fictional Owner Holdings"))
+        for guessed_key in (b"\x00" * 32, b"\xff" * 32, os.urandom(32), os.urandom(32)):
+            self.assertNotEqual(
+                report_digest, sanitizer.keyed_digest(guessed_key, "Fictional Owner Holdings"),
+            )
+
+    def test_digest_hides_length_and_character_class_unlike_masked_shape(self) -> None:
+        # masked_shape()'s length equals the original value's length and its
+        # character classes (letters vs digits) mirror the original, so
+        # shape length/composition alone narrows candidates when matched
+        # against surrounding output text. keyed_digest() must not carry
+        # that signal: values of very different length and composition
+        # collapse to the same fixed-length hex digest.
+        short_value = "ZX-FAKE-2048"
+        long_value = "Fabricated Engineering Group of North America, LLC"
+        self.assertNotEqual(len(short_value), len(long_value))
+        self.assertNotEqual(
+            len(sanitizer.masked_shape(short_value)), len(sanitizer.masked_shape(long_value)),
+        )
+        run_key = os.urandom(32)
+        short_digest = sanitizer.keyed_digest(run_key, short_value)
+        long_digest = sanitizer.keyed_digest(run_key, long_value)
+        self.assertEqual(len(short_digest), len(long_digest))
+        self.assertNotEqual(short_digest, long_digest)
+
+    def test_masked_shape_output_never_appears_in_the_serialized_report(self) -> None:
+        source, sizes = self.two_page_denylist_source()
+        result = sanitizer.verify_output(
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(),
+            self.root / "triage" / "sanitized_document_01", os.urandom(32),
+        )
+        serialized = json.dumps(result)
+        self.assertNotIn('"shape"', serialized)
+        self.assertNotIn(sanitizer.masked_shape("Fictional Owner Holdings"), serialized)
 
     def test_cross_block_page_stream_artifact_is_not_flagged(self) -> None:
         # Two far-apart blocks whose concatenation in the old whole-page text
@@ -628,7 +737,7 @@ class SanitizerTests(unittest.TestCase):
             return results
         return predict
 
-    def test_ner_review_is_report_only_with_masked_findings_and_crops(self) -> None:
+    def test_ner_review_is_report_only_with_keyed_findings_and_crops(self) -> None:
         source = self.root / "unlisted.pdf"
         pdf = canvas.Canvas(str(source), pagesize=letter)
         pdf.setFont("Helvetica", 12)
@@ -646,7 +755,7 @@ class SanitizerTests(unittest.TestCase):
         destination = self.root / "sanitized_document_01.pdf"
         report = sanitizer.sanitize_document(
             source, destination, "sanitized_document_01", FAKE_TERMS,
-            self.settings, self.root, ner_detector=detector,
+            self.settings, self.root, os.urandom(32), ner_detector=detector,
         )
         # Report-only: findings never change the verdict or the checks.
         self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
@@ -661,11 +770,9 @@ class SanitizerTests(unittest.TestCase):
         self.assertEqual(finding["occurrences"], 1)
         self.assertEqual(finding["label"], "company name")
         self.assertAlmostEqual(finding["score_max"], 0.91)
-        for ch in finding["shape"]:
-            if ch.isalpha():
-                self.assertIn(ch, "Aa")
-            elif ch.isdigit():
-                self.assertEqual(ch, "9")
+        self.assertNotIn("shape", finding)
+        self.assertEqual(len(finding["digest"]), 64)
+        self.assertTrue(all(ch in "0123456789abcdef" for ch in finding["digest"]))
         crop = self.root / finding["crop"]
         self.assertTrue(crop.is_file())
         with Image.open(crop) as image:
@@ -704,11 +811,11 @@ class SanitizerTests(unittest.TestCase):
 
         detector = sanitizer.NerDetector(
             overlapping_predict, ("company name", "organization"), 0.5, "stub-model",
-            max_findings=1,
+            max_findings={"_default": 1},
         )
         result = sanitizer.verify_output(
             source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(),
-            self.root / "triage" / "sanitized_document_01", ner_detector=detector,
+            self.root / "triage" / "sanitized_document_01", os.urandom(32), ner_detector=detector,
         )
         review = result["ner_review"]
         # Two occurrences, each span deduped to the higher-scored label...
@@ -725,9 +832,124 @@ class SanitizerTests(unittest.TestCase):
         # The NER layer is absent from reports when no detector is supplied.
         without = sanitizer.verify_output(
             source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(),
-            self.root / "triage" / "sanitized_document_01",
+            self.root / "triage" / "sanitized_document_01", os.urandom(32),
         )
         self.assertNotIn("ner_review", without)
+
+    @staticmethod
+    def stub_multi_ner_predict(targets_by_label: dict[str, list[str]]):
+        def predict(texts, labels, threshold):
+            results = []
+            for text in texts:
+                entities = []
+                for label, targets in targets_by_label.items():
+                    if label not in labels:
+                        continue
+                    for target in targets:
+                        cursor = 0
+                        while (found := text.find(target, cursor)) >= 0:
+                            entities.append({
+                                "start": found, "end": found + len(target),
+                                "label": label, "score": 0.9,
+                            })
+                            cursor = found + 1
+                results.append(entities)
+            return results
+        return predict
+
+    def test_per_label_cap_does_not_crowd_out_a_low_volume_label(self) -> None:
+        source = self.root / "many_firms.pdf"
+        pdf = canvas.Canvas(str(source), pagesize=letter)
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(45, 700, "Coordinate with Fictitious Firm Alpha on rough-in")
+        pdf.drawString(45, 680, "Coordinate with Fictitious Firm Beta on rough-in")
+        pdf.drawString(45, 660, "Coordinate with Fictitious Firm Gamma on rough-in")
+        pdf.drawString(45, 640, "Site access via 742 Evergreen Terrace Fictional Lane")
+        pdf.showPage()
+        pdf.save()
+        doc = fitz.open(source)
+        sizes = [(round(page.rect.width, 3), round(page.rect.height, 3)) for page in doc]
+        doc.close()
+
+        predict = self.stub_multi_ner_predict({
+            "organization": [
+                "Fictitious Firm Alpha", "Fictitious Firm Beta", "Fictitious Firm Gamma",
+            ],
+            "street address": ["742 Evergreen Terrace Fictional Lane"],
+        })
+        detector = sanitizer.NerDetector(
+            predict, ("organization", "street address"), 0.5, "stub-model",
+            # A single shared budget would let the three organization forms
+            # exhaust it before the one street address is ever seen.
+            max_findings={"_default": 1, "street address": 10},
+        )
+        result = sanitizer.verify_output(
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(),
+            self.root / "triage" / "sanitized_document_02", os.urandom(32), ner_detector=detector,
+        )
+        review = result["ner_review"]
+        # Only one of the three organization forms fits under its cap of 1...
+        self.assertEqual(review["distinct_form_counts"].get("organization"), 1)
+        # ...but the low-volume street address is never crowded out by it.
+        self.assertEqual(review["distinct_form_counts"].get("street address"), 1)
+        labels_seen = {finding["label"] for finding in review["findings"]}
+        self.assertIn("street address", labels_seen)
+        self.assertEqual(review["findings_truncated"], 2)
+
+    def test_findings_tie_break_order_is_stable_across_runs(self) -> None:
+        # Two distinct findings tied on occurrences and label. The sort's
+        # tie-break must not depend on the digest (keyed by a fresh random
+        # secret each run) or the same document would order its findings
+        # differently from run to run for no reason tied to its content.
+        source = self.root / "two_unlisted_firms.pdf"
+        pdf = canvas.Canvas(str(source), pagesize=letter)
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(45, 700, "Alpha Fictitious Builders shall coordinate with field staff")
+        pdf.drawString(45, 660, "Zeta Imaginary Contractors retains record documents")
+        pdf.showPage()
+        pdf.save()
+        doc = fitz.open(source)
+        sizes = [(round(page.rect.width, 3), round(page.rect.height, 3)) for page in doc]
+        doc.close()
+
+        def two_firm_predict(texts, labels, threshold):
+            results = []
+            for text in texts:
+                entities = []
+                for target in ("Alpha Fictitious Builders", "Zeta Imaginary Contractors"):
+                    found = text.find(target)
+                    if found >= 0:
+                        entities.append({
+                            "start": found, "end": found + len(target),
+                            "label": "company name", "score": 0.7,
+                        })
+                results.append(entities)
+            return results
+
+        detector = sanitizer.NerDetector(two_firm_predict, ("company name",), 0.5, "stub-model")
+        triage_dir = self.root / "triage" / "sanitized_document_01"
+
+        # Spy on keyed_digest to learn, for this test only, which original
+        # text produced which digest — the report itself never carries this
+        # mapping. This lets the test verify the sort order follows the
+        # deterministic surface form, not the random per-run digest.
+        real_keyed_digest = sanitizer.keyed_digest
+        digest_to_text: dict[str, str] = {}
+
+        def spy_keyed_digest(key: bytes, value: str) -> str:
+            digest = real_keyed_digest(key, value)
+            digest_to_text[digest] = value
+            return digest
+
+        with mock.patch.object(sanitizer, "keyed_digest", side_effect=spy_keyed_digest):
+            result = sanitizer.verify_output(
+                source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(), triage_dir, os.urandom(32),
+                ner_detector=detector,
+            )
+        findings = result["ner_review"]["findings"]
+        self.assertEqual(len(findings), 2)
+        texts_in_order = [digest_to_text[f["digest"]] for f in findings]
+        self.assertEqual(texts_in_order, sorted(texts_in_order, key=str.casefold))
 
     def test_review_report_serializes_without_sensitive_values(self) -> None:
         source = self.root / "source.pdf"
@@ -849,6 +1071,30 @@ class DenylistSeedingTest(unittest.TestCase):
             sanitizer.load_project_metadata(empty)
         with self.assertRaises(SystemExit):
             sanitizer.load_project_metadata(self.root / "absent.json")
+
+    def test_intake_empty_fields_none_path_is_every_field(self) -> None:
+        self.assertEqual(
+            sanitizer.intake_empty_fields(None), list(sanitizer.PROJECT_METADATA_FIELDS),
+        )
+
+    def test_intake_empty_fields_reports_exactly_the_blank_ones(self) -> None:
+        path = self.root / "partial.json"
+        path.write_text(json.dumps({
+            "project_name": "Example Confidential Project",
+            "project_number": "",
+            "project_address": None,
+            "owner": [],
+            "architect": ["   "],
+            "personnel": ["Jane Doe"],
+        }), encoding="utf-8")
+        empty = sanitizer.intake_empty_fields(path)
+        self.assertEqual(sorted(empty), sorted([
+            "project_number", "project_address", "site_address", "owner",
+            "architect", "engineers", "contractors", "consultants",
+            "other_identifiers",
+        ]))
+        self.assertNotIn("project_name", empty)
+        self.assertNotIn("personnel", empty)
 
     def test_proposals_are_filtered_and_never_written_as_a_denylist(self) -> None:
         source = self.root / "source.pdf"
@@ -990,7 +1236,7 @@ class FilePathPatternTest(unittest.TestCase):
         pdf.save()
         sanitizer.sanitize_document(
             source, root / "out.pdf", "sanitized_document_01",
-            FAKE_TERMS, sanitizer.Settings(), root,
+            FAKE_TERMS, sanitizer.Settings(), root, os.urandom(32),
             lexicons=sanitizer.load_lexicons(REPO_LEXICONS, REPO_ALLOWLIST),
         )
         output = fitz.open(root / "out.pdf")
@@ -1097,7 +1343,7 @@ class SuppressionSymmetryTest(unittest.TestCase):
         source = self.build()
         return sanitizer.sanitize_document(
             source, self.root / "out.pdf", "sanitized_document_01",
-            FAKE_TERMS, self.settings, self.root, lexicons=lexicons,
+            FAKE_TERMS, self.settings, self.root, os.urandom(32), lexicons=lexicons,
         )
 
     def test_schedule_cells_survive_and_the_run_still_passes(self) -> None:
@@ -1307,7 +1553,7 @@ class BuildRunPayloadTest(unittest.TestCase):
         reports = [{"release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS}]
         payload = sanitizer.build_run_payload(reports, self.FAKE_FINGERPRINT, ner_enabled=False)
         self.assertEqual(payload["fingerprint"], self.FAKE_FINGERPRINT)
-        self.assertEqual(payload["schema_version"], 3)
+        self.assertEqual(payload["schema_version"], 4)
         self.assertTrue(payload["all_automated_checks_pass"])
         self.assertEqual(payload["release_status"], sanitizer.RELEASE_STATUS_REVIEW_REQUIRED)
         self.assertFalse(any("NER" in note for note in payload["notes"]))
@@ -1325,6 +1571,57 @@ class BuildRunPayloadTest(unittest.TestCase):
         reports = [{"release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS}]
         payload = sanitizer.build_run_payload(reports, self.FAKE_FINGERPRINT, ner_enabled=True)
         self.assertTrue(any("NER" in note for note in payload["notes"]))
+
+    def test_truncated_residuals_add_an_incompleteness_note(self) -> None:
+        reports = [{
+            "document_id": "sanitized_document_01",
+            "release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS,
+            "residuals_truncated": 1,
+        }]
+        payload = sanitizer.build_run_payload(reports, self.FAKE_FINGERPRINT, ner_enabled=False)
+        # Still an internal AUTOMATED_PASS/REVIEW_REQUIRED outcome today (no
+        # code path here ever supplies a completed review), but the report
+        # must already say why this run could never become RELEASED as-is.
+        self.assertEqual(payload["release_status"], sanitizer.RELEASE_STATUS_REVIEW_REQUIRED)
+        self.assertTrue(any("truncat" in note.casefold() for note in payload["notes"]))
+
+    def test_truncated_ner_findings_add_an_incompleteness_note(self) -> None:
+        reports = [{
+            "document_id": "sanitized_document_01",
+            "release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS,
+            "ner_review": {"findings_truncated": 2},
+        }]
+        payload = sanitizer.build_run_payload(reports, self.FAKE_FINGERPRINT, ner_enabled=True)
+        self.assertTrue(any("truncat" in note.casefold() for note in payload["notes"]))
+
+    def test_incomplete_intake_without_waiver_adds_a_note(self) -> None:
+        reports = [{"document_id": "sanitized_document_01", "release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS}]
+        payload = sanitizer.build_run_payload(
+            reports, self.FAKE_FINGERPRINT, ner_enabled=False,
+            intake_status={"project_metadata_supplied": False, "empty_fields": ["owner"], "waiver": None},
+        )
+        self.assertTrue(any("intake" in note.casefold() for note in payload["notes"]))
+
+    def test_incomplete_intake_with_waiver_adds_no_note(self) -> None:
+        reports = [{"document_id": "sanitized_document_01", "release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS}]
+        payload = sanitizer.build_run_payload(
+            reports, self.FAKE_FINGERPRINT, ner_enabled=False,
+            intake_status={
+                "project_metadata_supplied": False, "empty_fields": ["owner"],
+                "waiver": "no PM system record for this small project",
+            },
+        )
+        self.assertFalse(any("intake" in note.casefold() for note in payload["notes"]))
+
+    def test_no_truncation_adds_no_incompleteness_note(self) -> None:
+        reports = [{
+            "document_id": "sanitized_document_01",
+            "release_status": sanitizer.RELEASE_STATUS_AUTOMATED_PASS,
+            "residuals_truncated": 0,
+            "ner_review": {"findings_truncated": 0},
+        }]
+        payload = sanitizer.build_run_payload(reports, self.FAKE_FINGERPRINT, ner_enabled=True)
+        self.assertFalse(any("truncat" in note.casefold() for note in payload["notes"]))
 
 
 class FingerprintCliWiringTest(unittest.TestCase):
@@ -1416,7 +1713,7 @@ class RasterVectorParityTest(unittest.TestCase):
     def run_on(self, source: Path) -> tuple[dict, str]:
         destination = self.root / f"{source.stem}_out.pdf"
         report = sanitizer.sanitize_document(
-            source, destination, source.stem, FAKE_TERMS, self.settings, self.root,
+            source, destination, source.stem, FAKE_TERMS, self.settings, self.root, os.urandom(32),
             lexicons=self.lex,
         )
         output = fitz.open(destination)
@@ -1500,7 +1797,7 @@ class MixedPageRasterTest(unittest.TestCase):
 
         destination = self.root / "out.pdf"
         report = sanitizer.sanitize_document(
-            source, destination, "doc", FAKE_TERMS, self.settings, self.root,
+            source, destination, "doc", FAKE_TERMS, self.settings, self.root, os.urandom(32),
             lexicons=self.lex,
         )
         self.assertEqual(report["release_status"], sanitizer.RELEASE_STATUS_AUTOMATED_PASS)
@@ -1562,7 +1859,7 @@ class RasterFailureContainmentTest(unittest.TestCase):
         with mock.patch.object(sanitizer, "ocr_detection_boxes", side_effect=fake_ocr_detection_boxes):
             destination = self.root / "out.pdf"
             report = sanitizer.sanitize_document(
-                source, destination, "doc", FAKE_TERMS, self.settings, self.root,
+                source, destination, "doc", FAKE_TERMS, self.settings, self.root, os.urandom(32),
             )
 
         self.assertEqual(
@@ -1617,7 +1914,7 @@ class ArchitectOfRecordTest(unittest.TestCase):
         destination = self.root / "out.pdf"
         lex = sanitizer.load_lexicons(REPO_LEXICONS, REPO_ALLOWLIST)
         report = sanitizer.sanitize_document(
-            source, destination, "doc", FAKE_TERMS, self.settings, self.root,
+            source, destination, "doc", FAKE_TERMS, self.settings, self.root, os.urandom(32),
             lexicons=lex,
         )
         self.assertIn(1, report["rasterized_pages"])
@@ -1654,7 +1951,7 @@ class AtomicRunPackagingTest(unittest.TestCase):
         self.temp_root.mkdir()
 
     @staticmethod
-    def fake_sanitize(source, destination, document_id, denylist, settings, temp_root,
+    def fake_sanitize(source, destination, document_id, denylist, settings, temp_root, run_key,
                       ner_detector=None, lexicons=None):
         destination.write_bytes(b"synthetic sanitized pdf")
         return {
@@ -1715,6 +2012,26 @@ class AtomicRunPackagingTest(unittest.TestCase):
             "status": "not_started", "reviewer": None, "completed_at": None,
         })
 
+    def test_run_key_is_never_written_to_disk(self) -> None:
+        known_key = b"\x01" * 32
+        with (
+            mock.patch.object(sanitizer, "sanitize_document", side_effect=self.fake_sanitize),
+            mock.patch.object(sanitizer, "runtime_versions", return_value={"python": "test"}),
+            mock.patch.object(sanitizer.secrets, "token_bytes", return_value=known_key),
+        ):
+            run_dir, _ = sanitizer.orchestrate_run(
+                sources=[self.source], output_root=self.output_root, output_index_start=1,
+                denylist={"Fictional Owner Holdings"}, settings=sanitizer.Settings(),
+                temp_root=self.temp_root, denylist_path=self.denylist,
+                project_metadata_path=None, config_path=self.config,
+                allowlist_path=self.allowlist, lexicon_dir=self.lexicons,
+                lexicons=None, ner_detector=None,
+            )
+        for name in ("report.json", "manifest.json", "review-summary.md"):
+            contents = (run_dir / name).read_bytes()
+            self.assertNotIn(known_key, contents)
+            self.assertNotIn(known_key.hex().encode(), contents)
+
     def test_failure_still_publishes_a_failure_record(self) -> None:
         with (
             mock.patch.object(sanitizer, "sanitize_document", side_effect=RuntimeError("boom")),
@@ -1732,6 +2049,57 @@ class AtomicRunPackagingTest(unittest.TestCase):
         self.assertEqual(payload["release_status"], sanitizer.RELEASE_STATUS_FAIL)
         self.assertEqual(payload["documents"][0]["release_status"], sanitizer.RELEASE_STATUS_FAIL)
         self.assertFalse(payload["documents"][0]["checks"]["processing_completed"])
+
+    def test_manifest_records_full_empty_field_list_with_no_project_metadata(self) -> None:
+        with (
+            mock.patch.object(sanitizer, "sanitize_document", side_effect=self.fake_sanitize),
+            mock.patch.object(sanitizer, "runtime_versions", return_value={"python": "test"}),
+        ):
+            run_dir, _ = sanitizer.orchestrate_run(
+                sources=[self.source], output_root=self.output_root, output_index_start=1,
+                denylist={"Fictional Owner Holdings"}, settings=sanitizer.Settings(),
+                temp_root=self.temp_root, denylist_path=self.denylist,
+                project_metadata_path=None, config_path=self.config,
+                allowlist_path=self.allowlist, lexicon_dir=self.lexicons,
+                lexicons=None, ner_detector=None, intake_waiver="no PM record for this pilot run",
+            )
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        self.assertEqual(manifest["intake"], {
+            "project_metadata_supplied": False,
+            "empty_fields": list(sanitizer.PROJECT_METADATA_FIELDS),
+            "waiver": "no PM record for this pilot run",
+        })
+
+    def test_manifest_records_exactly_the_blank_project_metadata_fields(self) -> None:
+        project_metadata = self.root / "project.json"
+        project_metadata.write_text(json.dumps({
+            "project_name": "Example Confidential Project",
+            "project_number": "ZX-FAKE-2048",
+        }))
+        with (
+            mock.patch.object(sanitizer, "sanitize_document", side_effect=self.fake_sanitize),
+            mock.patch.object(sanitizer, "runtime_versions", return_value={"python": "test"}),
+        ):
+            run_dir, _ = sanitizer.orchestrate_run(
+                sources=[self.source], output_root=self.output_root, output_index_start=1,
+                denylist={"Fictional Owner Holdings"}, settings=sanitizer.Settings(),
+                temp_root=self.temp_root, denylist_path=self.denylist,
+                project_metadata_path=project_metadata, config_path=self.config,
+                allowlist_path=self.allowlist, lexicon_dir=self.lexicons,
+                lexicons=None, ner_detector=None,
+            )
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        self.assertTrue(manifest["intake"]["project_metadata_supplied"])
+        self.assertIsNone(manifest["intake"]["waiver"])
+        self.assertEqual(sorted(manifest["intake"]["empty_fields"]), sorted([
+            field for field in sanitizer.PROJECT_METADATA_FIELDS
+            if field not in ("project_name", "project_number")
+        ]))
+        # The hash of the supplied project-metadata file is always recorded.
+        self.assertEqual(
+            manifest["fingerprint"]["project_metadata_sha256"],
+            hashlib.sha256(project_metadata.read_bytes()).hexdigest(),
+        )
 
 
 class RenderedPageOcrVerifierTest(unittest.TestCase):
@@ -1771,7 +2139,7 @@ class RenderedPageOcrVerifierTest(unittest.TestCase):
             return sanitizer.verify_output(
                 path, [(612.0, 792.0)] * len(fitz.open(path)),
                 sanitizer.DenylistMatcher({"Fictional Owner Holdings"}), set(),
-                self.root / "triage", settings=self.settings,
+                self.root / "triage", os.urandom(32), settings=self.settings,
                 lexicons=sanitizer.load_lexicons(REPO_LEXICONS, REPO_ALLOWLIST),
             )
 
@@ -2012,6 +2380,609 @@ class VerifyExistingTest(unittest.TestCase):
             verify_existing.IndependentLine("QUANTITY VOLTAGE", 105, 100, 250, 112),
         ]
         self.assertEqual(policy.scan_lines(lines), {})
+
+
+class ReviewerTriageTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="reviewer_triage_test_")
+        self.addCleanup(self.tmp.cleanup)
+        self.run_dir = Path(self.tmp.name)
+        self.decisions_path = self.run_dir / "decisions.json"
+
+        self.doc1_crop = self.run_dir / "triage" / "sanitized_document_01" / "residual_0001_page0003_denylist.png"
+        self.doc1_ner_crop = self.run_dir / "triage" / "sanitized_document_01" / "ner" / "ner_0001_page0001_person_name.png"
+        self.doc2_crop = self.run_dir / "triage" / "sanitized_document_02" / "residual_0001_page0001_street_address.png"
+        for crop in (self.doc1_crop, self.doc1_ner_crop, self.doc2_crop):
+            crop.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (4, 4), (255, 255, 255)).save(crop)
+
+        self.report = {
+            "documents": [
+                {
+                    "document_id": "sanitized_document_01",
+                    "residuals": [
+                        {
+                            "page": 3,
+                            "category": "denylist",
+                            "shape": "Aaaaa Aaaaa Aaaaaaaaaaa LLC",
+                            "crop": str(self.doc1_crop.relative_to(self.run_dir)),
+                        },
+                    ],
+                    "ner_review": {
+                        "findings": [
+                            {
+                                "label": "person name",
+                                "shape": "Aaaa A. Aaaaaaa",
+                                "occurrences": 7,
+                                "pages": [1, 4, 9],
+                                "score_max": 0.91,
+                                "zone": "title_block",
+                                "evidence": [],
+                                "crop": str(self.doc1_ner_crop.relative_to(self.run_dir)),
+                            },
+                        ],
+                        "findings_truncated": 0,
+                    },
+                },
+                {
+                    "document_id": "sanitized_document_02",
+                    "residuals": [
+                        {
+                            "page": 1,
+                            "category": "street_address",
+                            "shape": "999 Aaaaa Aa, Aaaaaaa, XX 99999",
+                            "crop": str(self.doc2_crop.relative_to(self.run_dir)),
+                        },
+                    ],
+                    "ner_review": {"findings": [], "findings_truncated": 0},
+                },
+            ],
+        }
+        (self.run_dir / "report.json").write_text(json.dumps(self.report))
+
+        self.output_sha_1 = hashlib.sha256(b"doc1").hexdigest()
+        self.output_sha_2 = hashlib.sha256(b"doc2").hexdigest()
+        self.manifest = {
+            "run_id": "test-run",
+            "documents": [
+                {
+                    "document_id": "sanitized_document_01",
+                    "output": {"path": "sanitized_document_01.pdf", "sha256": self.output_sha_1},
+                },
+                {
+                    "document_id": "sanitized_document_02",
+                    "output": {"path": "sanitized_document_02.pdf", "sha256": self.output_sha_2},
+                },
+            ],
+        }
+        (self.run_dir / "manifest.json").write_text(json.dumps(self.manifest))
+
+        self.findings = reviewer_triage.load_findings(self.report)
+        self.residual_finding_id = "sanitized_document_01:residual:3:denylist"
+        self.ner_finding_id = "sanitized_document_01:ner:person name:Aaaa A. Aaaaaaa"
+        self.doc2_finding_id = "sanitized_document_02:residual:1:street_address"
+
+    def test_load_findings_flattens_real_report_shape(self) -> None:
+        ids = {finding["id"] for finding in self.findings}
+        self.assertEqual(
+            ids, {self.residual_finding_id, self.ner_finding_id, self.doc2_finding_id},
+        )
+        residual = next(f for f in self.findings if f["id"] == self.residual_finding_id)
+        self.assertEqual(residual["document_id"], "sanitized_document_01")
+        self.assertEqual(residual["category"], "denylist")
+        self.assertEqual(residual["pages"], [3])
+        self.assertEqual(residual["crop"], str(self.doc1_crop.relative_to(self.run_dir)))
+        ner = next(f for f in self.findings if f["id"] == self.ner_finding_id)
+        self.assertEqual(ner["category"], "person name")
+        self.assertEqual(ner["occurrences"], 7)
+        self.assertEqual(ner["pages"], [1, 4, 9])
+
+    def test_reviewer_payload_hides_internal_fields(self) -> None:
+        payload = reviewer_triage.build_reviewer_payload(self.findings, {}, run_dir=self.run_dir)
+        banned_keys = {"category", "label", "shape", "occurrences", "score_max", "evidence", "zone", "source"}
+        allowed_keys = {"id", "plain_guess", "pages", "crop_url", "disposition", "note"}
+        for item in payload:
+            self.assertFalse(banned_keys & item.keys(), item)
+            self.assertTrue(set(item.keys()) <= allowed_keys, item)
+
+    def test_load_report_raises_when_manifest_is_missing(self) -> None:
+        empty_dir = self.run_dir / "no_manifest_here"
+        empty_dir.mkdir()
+        (empty_dir / "report.json").write_text(json.dumps({"documents": []}))
+        with self.assertRaises(ValueError):
+            reviewer_triage.load_report(empty_dir)
+
+    def test_plain_guess_covers_every_real_category_and_ner_label(self) -> None:
+        real_categories = set(sanitizer.DIRECT_PATTERNS.keys()) | {"denylist", "labelled_identifier"}
+        real_ner_labels = set(sanitizer.DEFAULT_NER_LABELS)
+        missing = (real_categories | real_ner_labels) - reviewer_triage.PLAIN_GUESS.keys()
+        self.assertEqual(missing, set(), f"no plain-language guess for: {missing}")
+
+    def test_reviewer_payload_gives_plain_language_guesses(self) -> None:
+        payload = reviewer_triage.build_reviewer_payload(self.findings, {}, run_dir=self.run_dir)
+        by_id = {item["id"]: item for item in payload}
+        self.assertEqual(
+            by_id[self.residual_finding_id]["plain_guess"],
+            reviewer_triage.PLAIN_GUESS["denylist"],
+        )
+        self.assertEqual(
+            by_id[self.ner_finding_id]["plain_guess"],
+            reviewer_triage.PLAIN_GUESS["person name"],
+        )
+
+    def test_reviewer_payload_crop_url_and_missing_crop_fallback(self) -> None:
+        payload = reviewer_triage.build_reviewer_payload(self.findings, {}, run_dir=self.run_dir)
+        by_id = {item["id"]: item for item in payload}
+        self.assertEqual(by_id[self.residual_finding_id]["crop_url"], f"/crops?id={self.residual_finding_id}")
+        self.doc1_crop.unlink()
+        payload = reviewer_triage.build_reviewer_payload(self.findings, {}, run_dir=self.run_dir)
+        by_id = {item["id"]: item for item in payload}
+        self.assertIsNone(by_id[self.residual_finding_id]["crop_url"])
+
+    def test_reviewer_payload_reflects_existing_decisions(self) -> None:
+        decisions = {
+            self.residual_finding_id: {"disposition": "safe", "note": "looks fine"},
+        }
+        payload = reviewer_triage.build_reviewer_payload(self.findings, decisions, run_dir=self.run_dir)
+        by_id = {item["id"]: item for item in payload}
+        self.assertEqual(by_id[self.residual_finding_id]["disposition"], "safe")
+        self.assertEqual(by_id[self.residual_finding_id]["note"], "looks fine")
+        self.assertNotIn("disposition", by_id[self.ner_finding_id])
+
+    def test_record_disposition_writes_entry_keyed_to_output_hash(self) -> None:
+        entry = reviewer_triage.record_disposition(
+            self.residual_finding_id, "duplicate", "already in denylist", self.decisions_path,
+        )
+        self.assertEqual(entry["document_id"], "sanitized_document_01")
+        self.assertEqual(entry["output_sha256"], self.output_sha_1)
+        self.assertEqual(entry["disposition"], "duplicate")
+        self.assertEqual(entry["note"], "already in denylist")
+        self.assertIn("decided_at", entry)
+
+        on_disk = json.loads(self.decisions_path.read_text())
+        self.assertEqual(on_disk["run_id"], "test-run")
+        self.assertEqual(on_disk["decisions"][self.residual_finding_id], entry)
+
+    def test_record_disposition_upserts_same_finding(self) -> None:
+        reviewer_triage.record_disposition(
+            self.residual_finding_id, "duplicate", "first note", self.decisions_path,
+        )
+        second = reviewer_triage.record_disposition(
+            self.residual_finding_id, "sensitive", "changed my mind", self.decisions_path,
+        )
+        on_disk = json.loads(self.decisions_path.read_text())
+        self.assertEqual(len(on_disk["decisions"]), 1)
+        self.assertEqual(on_disk["decisions"][self.residual_finding_id]["disposition"], "sensitive")
+        self.assertEqual(second["note"], "changed my mind")
+
+    def test_record_disposition_rejects_unknown_disposition(self) -> None:
+        with self.assertRaises(ValueError):
+            reviewer_triage.record_disposition(
+                self.residual_finding_id, "not_a_real_disposition", "", self.decisions_path,
+            )
+
+    def test_record_disposition_rejects_unresolvable_document(self) -> None:
+        with self.assertRaises(ValueError):
+            reviewer_triage.record_disposition(
+                "nonexistent_document:residual:1:denylist", "safe", "", self.decisions_path,
+            )
+
+    def test_record_disposition_keys_each_entry_to_its_own_document(self) -> None:
+        reviewer_triage.record_disposition(self.residual_finding_id, "safe", "", self.decisions_path)
+        entry2 = reviewer_triage.record_disposition(self.doc2_finding_id, "escalate", "", self.decisions_path)
+        self.assertEqual(entry2["output_sha256"], self.output_sha_2)
+        self.assertNotEqual(entry2["output_sha256"], self.output_sha_1)
+
+    def test_promotion_preview_duplicate_and_safe_only(self) -> None:
+        findings_by_id = {finding["id"]: finding for finding in self.findings}
+        decisions = {
+            self.residual_finding_id: {"disposition": "duplicate", "note": ""},
+            self.ner_finding_id: {"disposition": "safe", "note": ""},
+            self.doc2_finding_id: {"disposition": "sensitive", "note": ""},
+        }
+        preview = reviewer_triage.build_promotion_preview(findings_by_id, decisions)
+        self.assertEqual(len(preview["denylist_additions"]), 1)
+        self.assertEqual(preview["denylist_additions"][0]["shape"], "Aaaaa Aaaaa Aaaaaaaaaaa LLC")
+        self.assertEqual(len(preview["lexicon_proposals"]), 1)
+        self.assertEqual(preview["lexicon_proposals"][0]["shape"], "Aaaa A. Aaaaaaa")
+
+    def test_promotion_preview_escalate_and_sensitive_produce_nothing(self) -> None:
+        findings_by_id = {finding["id"]: finding for finding in self.findings}
+        decisions = {
+            self.residual_finding_id: {"disposition": "sensitive", "note": ""},
+            self.ner_finding_id: {"disposition": "escalate", "note": ""},
+        }
+        preview = reviewer_triage.build_promotion_preview(findings_by_id, decisions)
+        self.assertEqual(preview["denylist_additions"], [])
+        self.assertEqual(preview["lexicon_proposals"], [])
+
+    def test_reviewer_payload_never_contains_promotion_preview_data(self) -> None:
+        findings_by_id = {finding["id"]: finding for finding in self.findings}
+        decisions = {
+            self.residual_finding_id: {"disposition": "duplicate", "note": ""},
+            self.ner_finding_id: {"disposition": "safe", "note": ""},
+        }
+        preview = reviewer_triage.build_promotion_preview(findings_by_id, decisions)
+        preview_keys = set(preview.keys())
+        payload = reviewer_triage.build_reviewer_payload(self.findings, decisions, run_dir=self.run_dir)
+        for item in payload:
+            self.assertFalse(preview_keys & item.keys())
+
+    def start_server(self):
+        findings_by_id = {finding["id"]: finding for finding in self.findings}
+        server = reviewer_triage.make_server(
+            "127.0.0.1", 0, run_dir=self.run_dir, findings_by_id=findings_by_id,
+            decisions_path=self.decisions_path,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        # addCleanup runs LIFO: register in reverse of the order they must
+        # run (shutdown the serve_forever loop, then join the thread it was
+        # running in, then close the socket) or thread.join() hangs forever
+        # waiting for a thread nothing ever told to stop.
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def test_server_get_findings_and_post_decision_round_trip(self) -> None:
+        server = self.start_server()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+
+        with urllib.request.urlopen(f"{base}/api/findings") as response:
+            findings_response = json.loads(response.read())
+        ids = {item["id"] for item in findings_response}
+        self.assertIn(self.residual_finding_id, ids)
+
+        body = json.dumps({
+            "finding_id": self.residual_finding_id, "disposition": "duplicate", "note": "seen before",
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"{base}/api/decisions", data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.status, 200)
+            written = json.loads(response.read())
+        self.assertEqual(written["disposition"], "duplicate")
+        self.assertEqual(written["output_sha256"], self.output_sha_1)
+
+        on_disk = json.loads(self.decisions_path.read_text())
+        self.assertEqual(on_disk["decisions"][self.residual_finding_id]["note"], "seen before")
+
+    def test_server_post_unknown_finding_id_is_404(self) -> None:
+        server = self.start_server()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        body = json.dumps({
+            "finding_id": "no_such_finding", "disposition": "safe", "note": "",
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"{base}/api/decisions", data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(request)
+        self.addCleanup(ctx.exception.close)
+        self.assertEqual(ctx.exception.code, 404)
+
+    def test_server_post_bad_disposition_is_400(self) -> None:
+        server = self.start_server()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        body = json.dumps({
+            "finding_id": self.residual_finding_id, "disposition": "maybe", "note": "",
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"{base}/api/decisions", data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(request)
+        self.addCleanup(ctx.exception.close)
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_server_serves_crop_image(self) -> None:
+        server = self.start_server()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with urllib.request.urlopen(f"{base}/crops?id={urllib.parse.quote(self.residual_finding_id)}") as response:
+            self.assertEqual(response.headers["Content-Type"], "image/png")
+            self.assertEqual(response.read(), self.doc1_crop.read_bytes())
+
+    def test_server_ops_preview_never_reachable_from_reviewer_payload_endpoint(self) -> None:
+        server = self.start_server()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        reviewer_triage.record_disposition(self.residual_finding_id, "duplicate", "", self.decisions_path)
+        with urllib.request.urlopen(f"{base}/api/findings") as response:
+            findings_response = json.loads(response.read())
+        with urllib.request.urlopen(f"{base}/api/ops/preview") as response:
+            preview_response = json.loads(response.read())
+        self.assertEqual(len(preview_response["denylist_additions"]), 1)
+        preview_keys = set(preview_response.keys())
+        for item in findings_response:
+            self.assertFalse(preview_keys & item.keys())
+
+    def test_server_serves_reviewer_and_ops_html_pages(self) -> None:
+        server = self.start_server()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with urllib.request.urlopen(f"{base}/") as response:
+            self.assertIn(b"Review flagged items", response.read())
+        with urllib.request.urlopen(f"{base}/ops") as response:
+            self.assertIn(b"Promotion preview", response.read())
+
+    def test_reviewer_html_never_mentions_ops_or_promotion_terms(self) -> None:
+        source = reviewer_triage.REVIEWER_HTML.read_text().lower()
+        for banned in ("denylist", "lexicon", "/ops", "/api/ops"):
+            self.assertNotIn(banned, source)
+
+    def test_ops_html_has_no_disposition_controls(self) -> None:
+        source = reviewer_triage.OPS_HTML.read_text().lower()
+        for banned in ("sensitive", "fine to show", "already flagged", "ask someone else", "/api/decisions"):
+            self.assertNotIn(banned, source)
+class ResourceCeilingTest(unittest.TestCase):
+    """Ticket 02: a memory/CPU/disk ceiling breach must fail closed through
+    the same PageProcessingError path the Tesseract/Ghostscript timeouts use
+    (SanitizerTests.test_tesseract_timeout_fails_closed_per_page and
+    test_ghostscript_timeout_fails_closed_without_hanging) rather than
+    crashing or hanging. Real OS-level rlimit enforcement is platform-
+    inconsistent (notably unenforced on macOS), so breaches are forced here
+    by mocking the polled check, not by relying on the kernel to enforce it."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="resource_ceiling_test_")
+        self.root = Path(self.temp.name)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_memory_ceiling_forces_controlled_fail(self) -> None:
+        limits = sanitizer.ResourceLimits(max_memory_bytes=1)
+        with mock.patch.object(sanitizer, "process_peak_rss_bytes", return_value=10**9):
+            with self.assertRaises(sanitizer.PageProcessingError) as caught:
+                sanitizer.check_resource_ceilings(self.root, limits)
+        self.assertIn("memory", caught.exception.reason.lower())
+
+    def test_disk_ceiling_forces_controlled_fail(self) -> None:
+        (self.root / "big.bin").write_bytes(b"0" * 4096)
+        limits = sanitizer.ResourceLimits(max_staging_disk_bytes=1024)
+        with self.assertRaises(sanitizer.PageProcessingError) as caught:
+            sanitizer.check_resource_ceilings(self.root, limits)
+        self.assertIn("disk", caught.exception.reason.lower())
+
+    def test_ceilings_pass_silently_when_within_limits(self) -> None:
+        (self.root / "small.bin").write_bytes(b"0" * 16)
+        limits = sanitizer.ResourceLimits(max_memory_bytes=10**12, max_staging_disk_bytes=10**9)
+        sanitizer.check_resource_ceilings(self.root, limits)  # must not raise
+
+    def test_memory_breach_during_processing_fails_closed_per_page(self) -> None:
+        source = self.root / "source.pdf"
+        create_searchable_pdf(source)
+        destination = self.root / "sanitized_document_01.pdf"
+        settings = sanitizer.Settings(
+            ocr_dpi=220, barcode_dpi=72, min_vector_text_chars=20, progress_every_pages=0,
+            detect_barcodes=True, redact_repeated_margin_images=False,
+            resource_limits=sanitizer.ResourceLimits(max_memory_bytes=1, resource_check_every_pages=1),
+        )
+        with mock.patch.object(sanitizer, "process_peak_rss_bytes", return_value=10**9):
+            with self.assertRaises(sanitizer.PageProcessingError) as caught:
+                sanitizer.sanitize_document(
+                    source, destination, "sanitized_document_01", FAKE_TERMS, settings, self.root,
+                    os.urandom(32),
+                )
+        self.assertEqual(caught.exception.page_number, 1)
+        self.assertIn("memory", caught.exception.reason.lower())
+
+    def test_memory_breach_fails_the_run_closed_via_orchestrate_run(self) -> None:
+        # The acceptance criterion asks that "the run" fail closed, not just
+        # that sanitize_document raises — drive the real orchestrate_run
+        # path (AtomicRunPackagingTest's fixture pattern) with a real
+        # PageProcessingError from check_resource_ceilings and assert the
+        # run-level FAIL shape, matching
+        # AtomicRunPackagingTest.test_failure_still_publishes_a_failure_record.
+        source = self.root / "source.pdf"
+        source.write_bytes(b"synthetic source")
+        config = self.root / "config.json"
+        config.write_text("{}")
+        denylist = self.root / "denylist.json"
+        denylist.write_text(json.dumps({"identifiers": ["Fictional Owner Holdings"]}))
+        allowlist = self.root / "allowlist.json"
+        allowlist.write_text("{}")
+        lexicons = self.root / "lexicons"
+        lexicons.mkdir()
+        for name in sanitizer.LEXICON_FILENAMES:
+            (lexicons / name).write_text("{}")
+        output_root = self.root / "runs"
+        temp_root = self.root / "tmp"
+        temp_root.mkdir()
+
+        def breaching_sanitize(source, destination, document_id, denylist, settings, temp_root,
+                                run_key, ner_detector=None, lexicons=None):
+            sanitizer.check_resource_ceilings(destination.parent, settings.resource_limits, 1)
+            raise AssertionError("check_resource_ceilings should have raised")
+
+        settings = sanitizer.Settings(resource_limits=sanitizer.ResourceLimits(max_memory_bytes=1))
+        with (
+            mock.patch.object(sanitizer, "sanitize_document", side_effect=breaching_sanitize),
+            mock.patch.object(sanitizer, "runtime_versions", return_value={"python": "test"}),
+            mock.patch.object(sanitizer, "process_peak_rss_bytes", return_value=10**9),
+        ):
+            run_dir, payload = sanitizer.orchestrate_run(
+                sources=[source], output_root=output_root, output_index_start=1,
+                denylist={"Fictional Owner Holdings"}, settings=settings, temp_root=temp_root,
+                denylist_path=denylist, project_metadata_path=None, config_path=config,
+                allowlist_path=allowlist, lexicon_dir=lexicons, lexicons=None, ner_detector=None,
+            )
+        self.assertEqual(payload["release_status"], sanitizer.RELEASE_STATUS_FAIL)
+        self.assertFalse(payload["documents"][0]["checks"]["processing_completed"])
+        self.assertIn("memory ceiling exceeded", payload["documents"][0]["fail_reason"])
+        self.assertTrue((run_dir / "manifest.json").is_file())
+
+    def test_cpu_limit_signal_converts_to_controlled_fail(self) -> None:
+        with self.assertRaises(sanitizer.PageProcessingError) as caught:
+            sanitizer._handle_cpu_limit_signal(signal.SIGXCPU, None)
+        self.assertIn("CPU", caught.exception.reason)
+
+    def test_setrlimit_failures_on_unsupported_limits_do_not_raise(self) -> None:
+        with mock.patch.object(
+            sanitizer.resource, "setrlimit", side_effect=OSError("not supported"),
+        ):
+            sanitizer.apply_process_resource_limits(sanitizer.ResourceLimits())  # must not raise
+
+
+class RunCleanupTest(unittest.TestCase):
+    """Ticket 02: confidential triage crops are deleted once a run
+    completes successfully, and left untouched on any failure or partial
+    failure. Reuses AtomicRunPackagingTest's fixture/run pattern."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="run_cleanup_test_")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.source = self.root / "source.pdf"
+        self.source.write_bytes(b"synthetic source")
+        self.config = self.root / "config.json"
+        self.config.write_text("{}")
+        self.denylist = self.root / "denylist.json"
+        self.denylist.write_text(json.dumps({"identifiers": ["Fictional Owner Holdings"]}))
+        self.allowlist = self.root / "allowlist.json"
+        self.allowlist.write_text("{}")
+        self.lexicons = self.root / "lexicons"
+        self.lexicons.mkdir()
+        for name in sanitizer.LEXICON_FILENAMES:
+            (self.lexicons / name).write_text("{}")
+        self.output_root = self.root / "runs"
+        self.temp_root = self.root / "tmp"
+        self.temp_root.mkdir()
+
+    @staticmethod
+    def fake_sanitize_with_triage(release_status: str):
+        def fake_sanitize(source, destination, document_id, denylist, settings, temp_root,
+                           run_key, ner_detector=None, lexicons=None):
+            destination.write_bytes(b"synthetic sanitized pdf")
+            triage_dir = destination.parent / "triage" / document_id
+            triage_dir.mkdir(parents=True, exist_ok=True)
+            (triage_dir / "residual_0001_page0001_street_address.png").write_bytes(b"crop")
+            return {
+                "document_id": document_id,
+                "source_sha256": sanitizer.sha256_file(source),
+                "output_sha256": sanitizer.sha256_file(destination),
+                "pages": 1,
+                "checks": {"processing_completed": True},
+                "release_status": release_status,
+            }
+        return fake_sanitize
+
+    def run_once(self, fake_sanitize) -> tuple[Path, dict]:
+        with (
+            mock.patch.object(sanitizer, "sanitize_document", side_effect=fake_sanitize),
+            mock.patch.object(sanitizer, "runtime_versions", return_value={"python": "test"}),
+        ):
+            return sanitizer.orchestrate_run(
+                sources=[self.source], output_root=self.output_root, output_index_start=1,
+                denylist={"Fictional Owner Holdings"}, settings=sanitizer.Settings(),
+                temp_root=self.temp_root, denylist_path=self.denylist,
+                project_metadata_path=None, config_path=self.config,
+                allowlist_path=self.allowlist, lexicon_dir=self.lexicons,
+                lexicons=None, ner_detector=None,
+            )
+
+    def test_successful_run_deletes_triage_directory(self) -> None:
+        run_dir, payload = self.run_once(
+            self.fake_sanitize_with_triage(sanitizer.RELEASE_STATUS_AUTOMATED_PASS),
+        )
+        self.assertTrue(payload["all_automated_checks_pass"])
+        self.assertFalse((run_dir / "triage").exists())
+
+    def test_failed_run_leaves_triage_directory_untouched(self) -> None:
+        def raising_sanitize(source, destination, document_id, denylist, settings, temp_root,
+                              run_key, ner_detector=None, lexicons=None):
+            triage_dir = destination.parent / "triage" / document_id
+            triage_dir.mkdir(parents=True, exist_ok=True)
+            (triage_dir / "residual_0001_page0001_street_address.png").write_bytes(b"crop")
+            raise RuntimeError("boom")
+
+        run_dir, payload = self.run_once(raising_sanitize)
+        self.assertEqual(payload["release_status"], sanitizer.RELEASE_STATUS_FAIL)
+        self.assertTrue((run_dir / "triage" / "sanitized_document_01").is_dir())
+
+    def test_partial_pass_with_one_failed_document_leaves_triage_untouched(self) -> None:
+        second_source = self.root / "source2.pdf"
+        second_source.write_bytes(b"synthetic source 2")
+        statuses = iter([sanitizer.RELEASE_STATUS_AUTOMATED_PASS, sanitizer.RELEASE_STATUS_FAIL])
+
+        def mixed_sanitize(source, destination, document_id, denylist, settings, temp_root,
+                            run_key, ner_detector=None, lexicons=None):
+            destination.write_bytes(b"synthetic sanitized pdf")
+            triage_dir = destination.parent / "triage" / document_id
+            triage_dir.mkdir(parents=True, exist_ok=True)
+            (triage_dir / "residual_0001_page0001_street_address.png").write_bytes(b"crop")
+            return {
+                "document_id": document_id,
+                "source_sha256": sanitizer.sha256_file(source),
+                "output_sha256": sanitizer.sha256_file(destination),
+                "pages": 1,
+                "checks": {"processing_completed": True},
+                "release_status": next(statuses),
+            }
+
+        with (
+            mock.patch.object(sanitizer, "sanitize_document", side_effect=mixed_sanitize),
+            mock.patch.object(sanitizer, "runtime_versions", return_value={"python": "test"}),
+        ):
+            run_dir, payload = sanitizer.orchestrate_run(
+                sources=[self.source, second_source], output_root=self.output_root,
+                output_index_start=1, denylist={"Fictional Owner Holdings"},
+                settings=sanitizer.Settings(), temp_root=self.temp_root,
+                denylist_path=self.denylist, project_metadata_path=None,
+                config_path=self.config, allowlist_path=self.allowlist,
+                lexicon_dir=self.lexicons, lexicons=None, ner_detector=None,
+            )
+        self.assertFalse(payload["all_automated_checks_pass"])
+        self.assertTrue((run_dir / "triage").exists())
+
+
+class RunRetentionPruningTest(unittest.TestCase):
+    """Ticket 02: the retention-pruning maintenance step (tools/prune_runs.py)
+    deletes only run directories older than the configured window, and
+    never touches an orphaned staging directory from a crashed run (startup
+    recovery for abandoned runs is explicitly out of scope)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="run_retention_test_")
+        self.addCleanup(self.tmp.cleanup)
+        self.output_root = Path(self.tmp.name)
+
+    def _make_run_dir(self, name: str, age_days: float) -> Path:
+        run_dir = self.output_root / name
+        run_dir.mkdir(parents=True)
+        (run_dir / "report.json").write_text("{}")
+        timestamp = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=age_days)).timestamp()
+        os.utime(run_dir, (timestamp, timestamp))
+        return run_dir
+
+    def test_prune_removes_only_directories_older_than_window(self) -> None:
+        old_one = self._make_run_dir("run-old-1", age_days=40)
+        old_two = self._make_run_dir("run-old-2", age_days=10)
+        recent_one = self._make_run_dir("run-recent-1", age_days=2)
+        recent_two = self._make_run_dir("run-recent-2", age_days=0.1)
+
+        removed = sanitizer.prune_expired_runs(self.output_root, retention_days=7)
+
+        self.assertEqual(set(removed), {old_one, old_two})
+        self.assertFalse(old_one.exists())
+        self.assertFalse(old_two.exists())
+        self.assertTrue(recent_one.exists())
+        self.assertTrue(recent_two.exists())
+
+    def test_prune_ignores_staging_temp_directories(self) -> None:
+        stray_staging = self._make_run_dir(".20260101T000000.000000Z-abcd1234.tmp-xyz", age_days=40)
+
+        removed = sanitizer.prune_expired_runs(self.output_root, retention_days=7)
+
+        self.assertEqual(removed, [])
+        self.assertTrue(stray_staging.exists())
+
+    def test_prune_against_empty_output_root_returns_nothing(self) -> None:
+        empty_root = self.output_root / "does-not-exist-yet"
+        self.assertEqual(sanitizer.prune_expired_runs(empty_root, retention_days=7), [])
 
 
 if __name__ == "__main__":
