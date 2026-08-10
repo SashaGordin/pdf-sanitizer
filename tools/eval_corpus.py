@@ -22,27 +22,27 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-METRIC_LABELS_PATH = Path(__file__).with_name("metric_labels.py")
-_metric_labels_spec = importlib.util.spec_from_file_location("metric_labels", METRIC_LABELS_PATH)
-metric_labels = importlib.util.module_from_spec(_metric_labels_spec)
-assert _metric_labels_spec and _metric_labels_spec.loader
-sys.modules[_metric_labels_spec.name] = metric_labels
-_metric_labels_spec.loader.exec_module(metric_labels)
+
+def _load_sibling_module(name: str, filename: str):
+    """Load a sibling tools/*.py file the same way eval_sanitizer.py,
+    corpus_labeler.py, and prune_runs.py already do: dynamically, via
+    spec_from_file_location, since tools/ has no __init__.py and isn't a
+    package. Collapses this module's three sibling loads into one helper;
+    doesn't touch the pattern itself or any other file's copy of it."""
+    path = Path(__file__).with_name(filename)
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+metric_labels = _load_sibling_module("metric_labels", "metric_labels.py")
 DOCUMENT_LEVEL_RECALL_LABEL = metric_labels.DOCUMENT_LEVEL_RECALL_LABEL
 
-MODULE_PATH = Path(__file__).with_name("anonymize_construction_pdfs.py")
-_spec = importlib.util.spec_from_file_location("pdf_sanitizer", MODULE_PATH)
-sanitizer = importlib.util.module_from_spec(_spec)
-assert _spec and _spec.loader
-sys.modules[_spec.name] = sanitizer
-_spec.loader.exec_module(sanitizer)
-
-LABELER_MODULE_PATH = Path(__file__).with_name("corpus_labeler.py")
-_labeler_spec = importlib.util.spec_from_file_location("corpus_labeler", LABELER_MODULE_PATH)
-corpus_labeler = importlib.util.module_from_spec(_labeler_spec)
-assert _labeler_spec and _labeler_spec.loader
-sys.modules[_labeler_spec.name] = corpus_labeler
-_labeler_spec.loader.exec_module(corpus_labeler)
+sanitizer = _load_sibling_module("pdf_sanitizer", "anonymize_construction_pdfs.py")
+corpus_labeler = _load_sibling_module("corpus_labeler", "corpus_labeler.py")
 
 # Hand-drawn label boxes are drawn on a rasterized preview, not measured off
 # exact text-span geometry, so some positional slack against the residual's

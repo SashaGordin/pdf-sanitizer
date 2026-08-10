@@ -26,6 +26,16 @@ assert _sanitizer_spec and _sanitizer_spec.loader
 sys.modules[_sanitizer_spec.name] = sanitizer
 _sanitizer_spec.loader.exec_module(sanitizer)
 
+# DenylistMatcher(set()) compiles to a pattern with no alternatives, which
+# matches the empty string everywhere its lookarounds are satisfied — for
+# non-ASCII text (nothing in [A-Z0-9] to violate them), that's almost every
+# position, so an empty denylist over-redacts pathologically rather than
+# redacting nothing. main()'s CLI guards against this ("No denylist terms
+# are available"); tests that actually scan document text, unlike the
+# encrypted/malformed cases below (which never reach a scan), need a
+# non-empty placeholder that has nothing to do with the Japanese content.
+PLACEHOLDER_DENYLIST = {"Fictional Placeholder Firm", "ZX-PLACEHOLDER-0000"}
+
 
 class SyntheticEncryptedDocumentTest(unittest.TestCase):
     def test_sanitize_document_fails_closed_on_the_encrypted_synthetic_doc(self) -> None:
@@ -94,12 +104,44 @@ class SyntheticNonEnglishDocumentTest(unittest.TestCase):
             builder.build_non_english_document(source)
             destination = root / "out.pdf"
             report = sanitizer.sanitize_document(
-                source, destination, "doc", set(), sanitizer.Settings(), root, b"0" * 32,
+                source, destination, "doc", PLACEHOLDER_DENYLIST, sanitizer.Settings(), root, b"0" * 32,
             )
             output = fitz.open(destination)
             text = "".join(page.get_text("text") for page in output)
             output.close()
             self.assertNotIn("contact@example.invalid", text)
+
+    def test_sanitize_document_leaks_the_unseeded_japanese_person_and_firm_names(self) -> None:
+        # The documented generalization gap (tests/fixtures/corpus/synthetic/
+        # README.md), measured rather than asserted in prose: with no
+        # project-metadata/denylist seeding (the same "run as-is" scope this
+        # document exists to test), the person/firm/address/phone lines have
+        # no script-agnostic pattern to be caught by, and English-oriented
+        # NER/lexicon matching is not exercised here (no ner_detector
+        # passed) — so they survive untouched; only the email line (a
+        # regex-detected, script-agnostic category) is redacted. If this
+        # ever starts failing, the pipeline has gained non-English coverage
+        # worth documenting as a genuine improvement, not a regression to
+        # chase.
+        #
+        # Verified via redaction_counts/page_redactions rather than
+        # extracted output text: get_text("text") on the sanitized output is
+        # unreliable for this CJK content (the flatten step re-encodes the
+        # font in a way that garbles ToUnicode mapping on extraction), but a
+        # rendered pixmap of the output (checked manually while building
+        # this test) confirms the Japanese glyphs remain fully legible —
+        # this is a real leak, not an extraction artifact hiding a real
+        # redaction.
+        with tempfile.TemporaryDirectory(prefix="synthetic_non_english_gap_") as tmp:
+            root = Path(tmp)
+            source = root / "non_english_spec.pdf"
+            builder.build_non_english_document(source)
+            destination = root / "out.pdf"
+            report = sanitizer.sanitize_document(
+                source, destination, "doc", PLACEHOLDER_DENYLIST, sanitizer.Settings(), root, b"0" * 32,
+            )
+            self.assertEqual(report["redaction_counts"], {"email": 1})
+            self.assertEqual(report["page_redactions"], [{"page": 1, "categories": ["email"]}])
 
 
 if __name__ == "__main__":
