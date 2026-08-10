@@ -1,0 +1,16 @@
+{
+  "_about": {
+    "purpose": "Simulated intake for a client-provided public bid document — filled only with what the title block legitimately supplies before opening the PDF, per PROJECT_METADATA_FIELDS."
+  },
+  "project_name": ["Revenue District Office No. 14", "RDO 14"],
+  "project_number": [],
+  "project_address": [],
+  "site_address": [],
+  "owner": ["Bureau of Internal Revenue"],
+  "architect": [],
+  "engineers": [],
+  "contractors": [],
+  "consultants": [],
+  "personnel": [],
+  "other_identifiers": []
+}

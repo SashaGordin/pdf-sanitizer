@@ -1,0 +1,16 @@
+{
+  "_about": {
+    "purpose": "Simulated intake for a client-provided public bid document — filled only with what the title block legitimately supplies before opening the PDF, per PROJECT_METADATA_FIELDS."
+  },
+  "project_name": ["Stevenson Yard Maintenance Facility", "Construct Maintenance Facility"],
+  "project_number": ["CDB #630-128-005", "IDOT128-0001", "D0139", "D0140"],
+  "project_address": ["8630 Joliet Road, McCook, Illinois"],
+  "site_address": [],
+  "owner": ["State of Illinois Capital Development Board", "Illinois Department of Transportation"],
+  "architect": ["Muller & Muller, Ltd. - Architects"],
+  "engineers": [],
+  "contractors": [],
+  "consultants": [],
+  "personnel": [],
+  "other_identifiers": ["312-432-4180"]
+}

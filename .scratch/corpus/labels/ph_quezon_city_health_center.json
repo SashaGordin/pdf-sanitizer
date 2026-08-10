@@ -1,0 +1,188 @@
+{
+  "doc_id": "ph_quezon_city_health_center",
+  "source_pdf": "/Users/Sasha/Dev/clockwork/Taylor_Construction/.claude/worktrees/ticket-05-locked-corpus/.scratch/corpus/documents/ph_quezon_city_health_center.pdf",
+  "page_count": 30,
+  "exported_at": "2026-08-10T00:00:00+00:00",
+  "items": [
+    {
+      "id": "p0-project-title",
+      "page": 0,
+      "bbox": [
+        290,
+        295,
+        1020,
+        345
+      ],
+      "scale": 1.715339404829365,
+      "category": "project",
+      "sensitivity": "sensitive",
+      "disposition": "redact",
+      "note": "PROPOSED REHABILITATION OF FAIRVIEW SENTRONG SIGLA HEALTH CENTER"
+    },
+    {
+      "id": "p0-location",
+      "page": 0,
+      "bbox": [
+        290,
+        358,
+        770,
+        378
+      ],
+      "scale": 1.715339404829365,
+      "category": "address",
+      "sensitivity": "sensitive",
+      "disposition": "redact",
+      "note": "BARANGAY FAIRVIEW, DISTRICT 5, QUEZON CITY"
+    },
+    {
+      "id": "p0-phone",
+      "page": 0,
+      "bbox": [
+        335,
+        196,
+        660,
+        209
+      ],
+      "scale": 1.715339404829365,
+      "category": "contact",
+      "sensitivity": "sensitive",
+      "disposition": "redact",
+      "note": "Trunkline phone number"
+    },
+    {
+      "id": "p0-email",
+      "page": 0,
+      "bbox": [
+        335,
+        213,
+        660,
+        226
+      ],
+      "scale": 1.715339404829365,
+      "category": "contact",
+      "sensitivity": "sensitive",
+      "disposition": "redact",
+      "note": "engineering@quezoncity.gov.ph"
+    },
+    {
+      "id": "p0-doc-ref",
+      "page": 0,
+      "bbox": [
+        845,
+        68,
+        1020,
+        82
+      ],
+      "scale": 1.715339404829365,
+      "category": "account_id",
+      "sensitivity": "sensitive",
+      "disposition": "redact",
+      "note": "DED2025_0180 document reference code"
+    },
+    {
+      "id": "p0-toc-heading",
+      "page": 0,
+      "bbox": [
+        95,
+        430,
+        1020,
+        490
+      ],
+      "scale": 1.715339404829365,
+      "category": "boilerplate",
+      "sensitivity": "not_sensitive",
+      "disposition": "keep",
+      "note": "GENERAL AND SPECIAL CONDITIONS OF CONTRACT AND TECHNICAL SPECIFICATIONS heading + TOC start"
+    },
+    {
+      "id": "p1-toc-body",
+      "page": 1,
+      "bbox": [
+        90,
+        120,
+        1030,
+        1090
+      ],
+      "scale": 1.7160016710697426,
+      "category": "boilerplate",
+      "sensitivity": "not_sensitive",
+      "disposition": "keep",
+      "note": "Table of Contents body, sections II-8"
+    },
+    {
+      "id": "p9-reinforcement-para",
+      "page": 9,
+      "bbox": [
+        150,
+        395,
+        1030,
+        620
+      ],
+      "scale": 1.7113764057322076,
+      "category": "boilerplate",
+      "sensitivity": "not_sensitive",
+      "disposition": "keep",
+      "note": "Placing Reinforcement procedural spec text"
+    },
+    {
+      "id": "p16-manufacturer-spec",
+      "page": 16,
+      "bbox": [
+        150,
+        680,
+        1030,
+        720
+      ],
+      "scale": 1.7113764057322076,
+      "category": "manufacturer",
+      "sensitivity": "not_sensitive",
+      "disposition": "keep",
+      "note": "\"as per paint Manufacturer's specification and recommendation\""
+    },
+    {
+      "id": "p20-standard-reference",
+      "page": 20,
+      "bbox": [
+        150,
+        330,
+        1030,
+        400
+      ],
+      "scale": 1.714677649576099,
+      "category": "standard",
+      "sensitivity": "not_sensitive",
+      "disposition": "keep",
+      "note": "Philippine Electrical Code / Philippine Standard Agency (PSA) mark"
+    },
+    {
+      "id": "p29-project-title-drawing",
+      "page": 29,
+      "bbox": [
+        895,
+        235,
+        1290,
+        330
+      ],
+      "scale": 1.7140164047187758,
+      "category": "project",
+      "sensitivity": "sensitive",
+      "disposition": "redact",
+      "note": "PROPOSED FAIRVIEW SENTRONG SIGLA HEALTH CENTER drawing title"
+    },
+    {
+      "id": "p29-dimension-label",
+      "page": 29,
+      "bbox": [
+        583,
+        75,
+        615,
+        95
+      ],
+      "scale": 1.7140164047187758,
+      "category": "structural",
+      "sensitivity": "not_sensitive",
+      "disposition": "keep",
+      "note": "'4000' dimension callout"
+    }
+  ]
+}

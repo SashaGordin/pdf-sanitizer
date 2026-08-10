@@ -1,0 +1,16 @@
+{
+  "_about": {
+    "purpose": "Simulated intake for a client-provided standing municipal spec manual — filled only with what the title block legitimately supplies before opening the PDF, per PROJECT_METADATA_FIELDS."
+  },
+  "project_name": ["Construction Specifications"],
+  "project_number": [],
+  "project_address": [],
+  "site_address": [],
+  "owner": ["City of Corvallis", "City of Corvallis Department of Public Works", "City of Corvallis, Oregon"],
+  "architect": [],
+  "engineers": [],
+  "contractors": [],
+  "consultants": [],
+  "personnel": [],
+  "other_identifiers": []
+}

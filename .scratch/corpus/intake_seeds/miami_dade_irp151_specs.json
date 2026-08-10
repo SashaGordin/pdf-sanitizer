@@ -1,0 +1,16 @@
+{
+  "_about": {
+    "purpose": "Simulated intake for a downloaded (not client-supplied) public bid document — filled only with what the portal listing and title block legitimately supply before opening the PDF, per PROJECT_METADATA_FIELDS."
+  },
+  "project_name": ["USS Equipment Replacement - Phase 1", "USS Equipment Replacement Phase 1"],
+  "project_number": ["IRP151", "TP-0000008861", "MCC 7040", "MCC7040", "CICC 7040-0/07"],
+  "project_address": [],
+  "site_address": [],
+  "owner": ["Miami-Dade County Department of Transportation and Public Works", "Miami-Dade County DTPW"],
+  "architect": [],
+  "engineers": [],
+  "contractors": [],
+  "consultants": [],
+  "personnel": [],
+  "other_identifiers": []
+}

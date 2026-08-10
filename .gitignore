@@ -26,6 +26,12 @@ tmp/
 # NOTE: .scratch/ is intentionally NOT ignored. It holds specs and issue
 # tickets (see docs/agents/issue-tracker.md) and is meant to be versioned
 # with the code it describes. Don't add it here out of habit.
+#
+# One exception in practice, not in this file: .scratch/corpus/documents/
+# holds the real locked-corpus PDFs. It needs no separate rule — the
+# blanket *.pdf rule above already covers it — but is called out here so
+# nobody "fixes" that by un-ignoring it. The corpus's metadata
+# (manifest.json, labels/, intake_seeds/) stays tracked as normal.
 
 # --- macOS ---
 .DS_Store

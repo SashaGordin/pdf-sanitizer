@@ -2252,6 +2252,19 @@ def sweep_flattened_output(
 TRIAGE_LIMIT = 200
 
 
+def union_bbox(rects: Sequence[fitz.Rect]) -> list[float] | None:
+    """The bounding box of one or more rects, in PDF-point space, as
+    [x0, y0, x1, y1] — the same union render_residual_crop computes for its
+    context box, exposed on the report so a labeled corpus item can be
+    matched against the detection that produced it."""
+    if not rects:
+        return None
+    region = fitz.Rect(rects[0])
+    for rect in rects[1:]:
+        region.include_rect(rect)
+    return [round(region.x0, 3), round(region.y0, 3), round(region.x1, 3), round(region.y1, 3)]
+
+
 def render_residual_crop(
     page: fitz.Page, rects: Sequence[fitz.Rect], path: Path, dpi: int = 150,
 ) -> Path | None:
@@ -2559,6 +2572,7 @@ def verify_output(
                 "page": page_index + 1,
                 "category": category,
                 "digest": keyed_digest(run_key, match.group()),
+                "bbox": union_bbox(match_rects),
             }
             crop_name = f"residual_{len(residuals) + 1:04d}_page{page_index + 1:04d}_{category}.png"
             crop_path = render_residual_crop(
@@ -2605,6 +2619,7 @@ def verify_output(
                         continue
                     ner_forms_by_label[label] += 1
                     label_slug = re.sub(r"[^a-z0-9]+", "_", label.casefold()).strip("_") or "entity"
+                    finding_rects = rects_for_block_span(block, start, end)
                     record = {
                         "label": label,
                         "digest": keyed_digest(run_key, text),
@@ -2612,6 +2627,7 @@ def verify_output(
                         "pages": [],
                         "score_max": 0.0,
                         "zone": zone,
+                        "bbox": union_bbox(finding_rects),
                         "evidence": sorted(set(
                             e for e in (
                                 lexicons.has_manufacturer_context(block.text, start, end)
@@ -2620,7 +2636,7 @@ def verify_output(
                         )),
                     }
                     crop_path = render_residual_crop(
-                        page, rects_for_block_span(block, start, end),
+                        page, finding_rects,
                         triage_dir / "ner" / (
                             f"ner_{len(ner_forms) + 1:04d}_page{page_index + 1:04d}_{label_slug}.png"
                         ),
