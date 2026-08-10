@@ -28,6 +28,8 @@ machine — this does not change ADR-0001's "not a network service" status.
 
 **Status:** done
 
+**GitHub issue:** https://github.com/SashaGordin/pdf-sanitizer/issues/21
+
 - [x] Launching the tool against a real corpus PDF path renders that
       document's actual pages (not a placeholder) for labeling.
 - [x] Drawing a box and tagging it (category, sensitivity, disposition,

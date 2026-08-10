@@ -31,6 +31,8 @@ or lexicons.
 
 **Status:** done
 
+**GitHub issue:** https://github.com/SashaGordin/pdf-sanitizer/issues/23
+
 - [x] Launching the tool against a real run directory shows that run's real
       findings, each with its real crop and a plain-language category guess
       — no internal labels, occurrence counts, or match scores visible to

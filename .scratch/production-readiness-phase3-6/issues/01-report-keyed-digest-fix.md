@@ -14,7 +14,9 @@ actually leaves the machine alongside the sanitized output.
 
 **Blocked by:** none.
 
-**Status:** todo
+**Status:** ready-for-agent
+
+**GitHub issue:** https://github.com/SashaGordin/pdf-sanitizer/issues/18
 
 - [ ] Every `residuals` and `ner_review.findings` entry in the report uses
       the new keyed digest by default; `masked_shape()`'s output no longer

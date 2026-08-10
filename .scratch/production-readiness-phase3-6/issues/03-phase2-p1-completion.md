@@ -22,6 +22,8 @@ three — no further design ticket was needed.
 
 **Status:** done
 
+**GitHub issue:** https://github.com/SashaGordin/pdf-sanitizer/issues/20
+
 - [x] A synthetic document with a high-volume label (e.g. many `organization`
       matches) and a low-volume high-value label (e.g. one `street address`)
       proves the low-volume label is never dropped due to the cap, with caps

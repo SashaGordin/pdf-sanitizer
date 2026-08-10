@@ -29,7 +29,9 @@ recall" `eval_sanitizer.py` reports.
 **Blocked by:** 04 (needs the real labeling tool to produce the corpus's
 labels).
 
-**Status:** todo
+**Status:** ready-for-agent
+
+**GitHub issue:** https://github.com/SashaGordin/pdf-sanitizer/issues/22
 
 - [ ] The locked corpus directory contains the 8 sourced real documents (or a
       documented subset, if the Missouri document is excluded pending

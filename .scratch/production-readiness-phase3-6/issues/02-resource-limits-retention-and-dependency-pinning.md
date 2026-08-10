@@ -24,7 +24,9 @@ issue #8's "apply now, light version" list:
 
 **Blocked by:** none.
 
-**Status:** todo
+**Status:** ready-for-agent
+
+**GitHub issue:** https://github.com/SashaGordin/pdf-sanitizer/issues/19
 
 - [ ] A synthetic test that forces the memory/CPU limit past its ceiling
       (mocked) proves the run fails closed with a controlled `FAIL`, not a
