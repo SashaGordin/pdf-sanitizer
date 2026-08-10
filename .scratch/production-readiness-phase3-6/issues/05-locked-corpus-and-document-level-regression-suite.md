@@ -29,28 +29,61 @@ recall" `eval_sanitizer.py` reports.
 **Blocked by:** 04 (needs the real labeling tool to produce the corpus's
 labels).
 
-**Status:** ready-for-agent
+**Status:** done
 
 **GitHub issue:** https://github.com/SashaGordin/pdf-sanitizer/issues/22
 
-- [ ] The locked corpus directory contains the 8 sourced real documents (or a
+- [x] The locked corpus directory contains the 8 sourced real documents (or a
       documented subset, if the Missouri document is excluded pending
       counsel review) plus synthetic documents for encrypted, malformed, and
       non-English cases.
 - [ ] Every corpus item's label carries bounding box, category, sensitivity
       decision, and expected disposition.
-- [ ] The new document-level regression harness runs the real sanitizer
+- [x] The new document-level regression harness runs the real sanitizer
       against the locked corpus and reports recall/over-redaction, broken
       out by document type, category, detection surface, language, and image
       quality — not as one aggregate percentage.
-- [ ] The harness's output explicitly labels its metric "document-level
+- [x] The harness's output explicitly labels its metric "document-level
       recall," and a test/lint-style check confirms it's never referred to
       as unqualified "recall" or conflated with `eval_sanitizer.py`'s output.
 - [ ] Zero known false negatives on the locked corpus's must-redact set;
       zero unexplained over-redactions on its must-survive set (or, for any
       exception, an explicit documented reason).
-- [ ] Every leak discovered while running the harness against the locked
+- [x] Every leak discovered while running the harness against the locked
       corpus gets a permanent regression test in the existing
       `GoldenSetTest`-style pattern.
 
 ## Comments
+
+Implementation landed as `tools/eval_corpus.py` (PR #34), a new harness
+alongside (not replacing) `eval_sanitizer.py` that runs the real sanitizer
+end-to-end against the locked corpus. `.scratch/corpus/` holds 7 real
+documents (2 fetched live from public bid portals — CA DGS project 25-277693,
+Miami-Dade DTPW IRP151 — plus 5 client-provided); the Missouri document is
+excluded pending counsel review (`.scratch/corpus/EXCLUDED.md`), per this
+ticket's own instruction not to resolve that here. Three synthetic documents
+(`tests/fixtures/corpus/synthetic/`) cover the encrypted/malformed/non-English
+dimension-table cells. `tools/metric_labels.py` +
+`tests/test_metric_naming.py` guard "document-level recall" against
+conflation with `eval_sanitizer.py`'s "policy-vocabulary recall".
+`tests/test_locked_corpus_regression.py` (`LockedCorpusRegressionTest`)
+mirrors `GoldenSetTest`'s shape as the permanent home for any future leak
+found against the locked corpus.
+
+Two criteria remain open, called out in PR #34 as scope boundaries approved
+before merge rather than oversights:
+
+- **Labeling is incomplete.** Only the Quezon City health center document
+  (the shortest, and the corpus's only scanned/poor-OCR sample) is hand-labeled
+  via `tools/corpus_labeler.py`, proving the harness against real data (6
+  hits, 0 misses, 0 over-redactions). The other 6 real documents are left for
+  the user to label with the same tool — see `.scratch/corpus/labels/README.md`.
+- **The non-English detection gap is measured, not fixed.** The synthetic
+  Japanese document runs through the pipeline unchanged; it leaks
+  person/firm/address/phone and only the email is caught. No
+  language-detection feature was added to close this.
+
+The "zero known false negatives / zero unexplained over-redactions" claim
+therefore only holds for the labeled subset today, not the full locked
+corpus — that criterion and the labeling-completeness criterion stay
+unchecked as follow-up work.
