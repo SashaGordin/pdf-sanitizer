@@ -26,7 +26,9 @@ The real confidential pilot (Phase 6 steps 2 and 5–6) is explicitly not part
 of this ticket — it stays unscheduled pending an actual paying client
 engagement.
 
-**Blocked by:** 05 (needs the assembled locked corpus).
+**Blocked by:** 05 (needs the assembled locked corpus); 08 (needs a way to
+get real annotations from the actual client, who is not the operator and
+not on the operator's machine).
 
 **Status:** ready-for-agent
 
@@ -47,3 +49,19 @@ engagement.
       engagement.
 
 ## Comments
+
+2026-08-09: Only 1 of the 8 real locked-corpus documents
+(`ph_quezon_city_health_center`) is labeled — ticket 05 left the other 7 for
+the operator. Investigating that gap surfaced that the real annotator for
+this ticket's "client" step is a specific trusted person the operator
+doesn't run the labeling tool on behalf of, and isn't the operator running
+it locally themselves — so ticket 04's tool needs to reach that person on
+their own machine before step 2 can happen at all.
+
+Per the operator's explicit decision, this ticket is on hold: the pipeline
+run, the comparison, and the go/no-go checklist walkthrough are
+deliberately **not** being executed yet. Filed ticket 08 to package
+`tools/corpus_labeler.py` as a standalone executable that person can run
+with no setup; once they return real annotations, this ticket resumes with
+those labels in `.scratch/corpus/labels/`. Nothing in this ticket's own
+acceptance checklist has been touched.
