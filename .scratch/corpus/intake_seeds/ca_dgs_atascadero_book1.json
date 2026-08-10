@@ -1,0 +1,16 @@
+{
+  "_about": {
+    "purpose": "Simulated intake for a client-provided public bid document — filled only with what the title block legitimately supplies before opening the PDF, per PROJECT_METADATA_FIELDS."
+  },
+  "project_name": ["DSH-Atascadero Re-Roof, HVAC Replacement & Electrical Upgrades"],
+  "project_number": ["DGS000000142452", "142452"],
+  "project_address": ["Atascadero, San Luis Obispo County, California"],
+  "site_address": [],
+  "owner": ["Department of State Hospitals", "California Department of General Services"],
+  "architect": [],
+  "engineers": [],
+  "contractors": [],
+  "consultants": [],
+  "personnel": ["Matt Davidson"],
+  "other_identifiers": []
+}

@@ -1,0 +1,16 @@
+{
+  "_about": {
+    "purpose": "Simulated intake for a client-provided public bid document — filled only with what the title block legitimately supplies before opening the PDF, per PROJECT_METADATA_FIELDS."
+  },
+  "project_name": ["Proposed Rehabilitation of Fairview Sentrong Sigla Health Center"],
+  "project_number": ["DED2025 0180"],
+  "project_address": ["Barangay Fairview, District 5, Quezon City"],
+  "site_address": [],
+  "owner": ["Quezon City Department of Engineering", "Quezon City Hall"],
+  "architect": [],
+  "engineers": [],
+  "contractors": [],
+  "consultants": [],
+  "personnel": [],
+  "other_identifiers": ["engineering@quezoncity.gov.ph"]
+}

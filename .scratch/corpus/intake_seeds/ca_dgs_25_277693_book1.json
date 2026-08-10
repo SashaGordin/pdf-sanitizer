@@ -1,0 +1,16 @@
+{
+  "_about": {
+    "purpose": "Simulated intake for a downloaded (not client-supplied) public bid document — filled only with what the portal listing and title block legitimately supply before opening the PDF, per PROJECT_METADATA_FIELDS."
+  },
+  "project_name": ["RESD Street Demolition"],
+  "project_number": ["25-277693", "11927A", "00000000011927A"],
+  "project_address": ["345 Ash Street, San Diego"],
+  "site_address": ["1301 State Street, San Diego"],
+  "owner": ["Department of Housing and Community Development", "California Department of General Services"],
+  "architect": [],
+  "engineers": [],
+  "contractors": [],
+  "consultants": [],
+  "personnel": ["David Keltgen"],
+  "other_identifiers": []
+}

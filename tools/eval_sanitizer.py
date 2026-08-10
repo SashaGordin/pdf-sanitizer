@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Score the sanitizer's decisions against a labelled golden set.
 
+This is "policy-vocabulary recall" — a pure string/vocabulary check against
+tests/golden/mlk_labels.json, never opens a PDF. It is a different, distinct
+metric from tools/eval_corpus.py's "document-level recall" (the real
+sanitizer run end-to-end against the locked corpus) — see
+tools/metric_labels.py and tests/test_metric_naming.py.
+
 Answers three questions that eyeballing a report cannot:
 
-  RECALL          of the identifiers that MUST be redacted, how many are?
-                  A miss is an NDA breach. This is the number that gates release.
+  POLICY-VOCABULARY RECALL   of the identifiers that MUST be redacted, how
+                  many are? A miss is an NDA breach. This is the number that
+                  gates release.
   OVER-REDACTION  of the things that must survive, how many get destroyed?
                   This is technical content lost from the deliverable.
   NOISE           of the things that must survive, how many still reach the
@@ -34,6 +41,14 @@ sanitizer = importlib.util.module_from_spec(_spec)
 assert _spec and _spec.loader
 sys.modules[_spec.name] = sanitizer
 _spec.loader.exec_module(sanitizer)
+
+METRIC_LABELS_PATH = Path(__file__).with_name("metric_labels.py")
+_metric_labels_spec = importlib.util.spec_from_file_location("metric_labels", METRIC_LABELS_PATH)
+metric_labels = importlib.util.module_from_spec(_metric_labels_spec)
+assert _metric_labels_spec and _metric_labels_spec.loader
+sys.modules[_metric_labels_spec.name] = metric_labels
+_metric_labels_spec.loader.exec_module(metric_labels)
+POLICY_VOCABULARY_RECALL_LABEL = metric_labels.POLICY_VOCABULARY_RECALL_LABEL
 
 MUST_REDACT = {"party"}
 MUST_SURVIVE = {"manufacturer", "boilerplate", "structural", "garbage", "hard_negative"}
@@ -154,7 +169,8 @@ def main() -> int:
     def pct(n: int, d: int) -> str:
         return f"{100 * n / d:5.1f}%" if d else "    n/a"
 
-    print(f"\n  RECALL           {pct(result['party_redacted'], result['party_total'])}   "
+    print(f"\n  {POLICY_VOCABULARY_RECALL_LABEL.upper()}   "
+          f"{pct(result['party_redacted'], result['party_total'])}   "
           f"({result['party_redacted']}/{result['party_total']} identifiers redacted)   <- release gate")
     print(f"  OVER-REDACTION   {pct(result['survive_redacted'], result['survive_total'])}   "
           f"({result['survive_redacted']}/{result['survive_total']} must-survive entries destroyed)")

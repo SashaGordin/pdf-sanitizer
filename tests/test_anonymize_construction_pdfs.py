@@ -519,6 +519,34 @@ class SanitizerTests(unittest.TestCase):
             with Image.open(crop) as image:
                 self.assertGreater(image.width, 10)
 
+    def test_verifier_residuals_carry_a_bbox_in_pdf_point_space(self) -> None:
+        source = self.root / "leaky_bbox.pdf"
+        pdf = canvas.Canvas(str(source), pagesize=letter)
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(45, 700, "Contact leak.person@example.invalid for access")
+        pdf.showPage()
+        pdf.save()
+        doc = fitz.open(source)
+        sizes = [(round(page.rect.width, 3), round(page.rect.height, 3)) for page in doc]
+        page_rect = doc[0].rect
+        doc.close()
+        triage_dir = self.root / "triage" / "sanitized_document_01"
+        result = sanitizer.verify_output(
+            source, sizes, sanitizer.DenylistMatcher(FAKE_TERMS), set(), triage_dir, os.urandom(32),
+        )
+        residuals = result["residuals"]
+        self.assertGreaterEqual(len(residuals), 1)
+        for residual in residuals:
+            bbox = residual["bbox"]
+            self.assertEqual(len(bbox), 4)
+            x0, y0, x1, y1 = bbox
+            self.assertLess(x0, x1)
+            self.assertLess(y0, y1)
+            self.assertGreaterEqual(x0, 0)
+            self.assertGreaterEqual(y0, 0)
+            self.assertLessEqual(x1, page_rect.width)
+            self.assertLessEqual(y1, page_rect.height)
+
     def two_page_denylist_source(self) -> tuple[Path, list[tuple[float, float]]]:
         source = self.root / "repeated.pdf"
         pdf = canvas.Canvas(str(source), pagesize=letter)
@@ -785,6 +813,36 @@ class SanitizerTests(unittest.TestCase):
         output.close()
         self.assertIn("Unlisted Fabricated Consultants", text)
         self.assertIn("SMACNA", text)
+
+    def test_ner_finding_carries_a_bbox_in_pdf_point_space(self) -> None:
+        source = self.root / "unlisted_bbox.pdf"
+        pdf = canvas.Canvas(str(source), pagesize=letter)
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(45, 700, "Coordinate ductwork with Unlisted Fabricated Consultants prior to rough-in")
+        pdf.showPage()
+        pdf.save()
+        doc = fitz.open(source)
+        page_rect = doc[0].rect
+        doc.close()
+        detector = sanitizer.NerDetector(
+            self.stub_ner_predict("Unlisted Fabricated Consultants", "company name", 0.91),
+            ("company name",), 0.5, "stub-model",
+        )
+        destination = self.root / "sanitized_document_01.pdf"
+        report = sanitizer.sanitize_document(
+            source, destination, "sanitized_document_01", FAKE_TERMS,
+            self.settings, self.root, os.urandom(32), ner_detector=detector,
+        )
+        finding = report["ner_review"]["findings"][0]
+        bbox = finding["bbox"]
+        self.assertEqual(len(bbox), 4)
+        x0, y0, x1, y1 = bbox
+        self.assertLess(x0, x1)
+        self.assertLess(y0, y1)
+        self.assertGreaterEqual(x0, 0)
+        self.assertGreaterEqual(y0, 0)
+        self.assertLessEqual(x1, page_rect.width)
+        self.assertLessEqual(y1, page_rect.height)
 
     def test_ner_findings_dedupe_and_truncate_without_affecting_counts(self) -> None:
         source = self.root / "two_firms.pdf"
