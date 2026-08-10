@@ -2828,9 +2828,10 @@ class ResourceCeilingTest(unittest.TestCase):
 
 
 class RunCleanupTest(unittest.TestCase):
-    """Ticket 02: confidential triage crops are deleted once a run
-    completes successfully, and left untouched on any failure or partial
-    failure. Reuses AtomicRunPackagingTest's fixture/run pattern."""
+    """Ticket 02 / issue #32: confidential triage crops survive run
+    completion regardless of automated outcome — deletion only happens once
+    a human completes review (see TriagePruningTest), never at pipeline
+    completion. Reuses AtomicRunPackagingTest's fixture/run pattern."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="run_cleanup_test_")
@@ -2884,12 +2885,12 @@ class RunCleanupTest(unittest.TestCase):
                 lexicons=None, ner_detector=None,
             )
 
-    def test_successful_run_deletes_triage_directory(self) -> None:
+    def test_successful_run_leaves_triage_directory_for_review(self) -> None:
         run_dir, payload = self.run_once(
             self.fake_sanitize_with_triage(sanitizer.RELEASE_STATUS_AUTOMATED_PASS),
         )
         self.assertTrue(payload["all_automated_checks_pass"])
-        self.assertFalse((run_dir / "triage").exists())
+        self.assertTrue((run_dir / "triage").exists())
 
     def test_failed_run_leaves_triage_directory_untouched(self) -> None:
         def raising_sanitize(source, destination, document_id, denylist, settings, temp_root,
@@ -2983,6 +2984,90 @@ class RunRetentionPruningTest(unittest.TestCase):
     def test_prune_against_empty_output_root_returns_nothing(self) -> None:
         empty_root = self.output_root / "does-not-exist-yet"
         self.assertEqual(sanitizer.prune_expired_runs(empty_root, retention_days=7), [])
+
+
+class TriagePruningTest(unittest.TestCase):
+    """Issue #32: the reviewed-triage maintenance step
+    (sanitizer.prune_reviewed_triage, wired into tools/prune_runs.py) only
+    deletes a run's triage/ directory once its manifest.json records
+    review.status == "complete" — never on run completion alone."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="triage_pruning_test_")
+        self.addCleanup(self.tmp.cleanup)
+        self.output_root = Path(self.tmp.name)
+
+    def _make_run_dir(self, name: str, *, review_status: str | None, with_triage: bool = True) -> Path:
+        run_dir = self.output_root / name
+        run_dir.mkdir(parents=True)
+        if review_status is not None:
+            manifest = {"review": {"status": review_status}}
+            (run_dir / "manifest.json").write_text(json.dumps(manifest))
+        if with_triage:
+            triage_dir = run_dir / "triage" / "sanitized_document_01"
+            triage_dir.mkdir(parents=True)
+            (triage_dir / "residual_0001_page0001_street_address.png").write_bytes(b"crop")
+        return run_dir
+
+    def test_reviewed_run_has_triage_directory_removed(self) -> None:
+        run_dir = self._make_run_dir("run-reviewed", review_status="complete")
+
+        removed = sanitizer.prune_reviewed_triage(self.output_root)
+
+        self.assertEqual(removed, [run_dir / "triage"])
+        self.assertFalse((run_dir / "triage").exists())
+
+    def test_unreviewed_run_leaves_triage_directory_untouched(self) -> None:
+        run_dir = self._make_run_dir("run-unreviewed", review_status="not_started")
+
+        removed = sanitizer.prune_reviewed_triage(self.output_root)
+
+        self.assertEqual(removed, [])
+        self.assertTrue((run_dir / "triage").exists())
+
+    def test_run_with_no_manifest_is_skipped_without_raising(self) -> None:
+        run_dir = self._make_run_dir("run-no-manifest", review_status=None)
+
+        removed = sanitizer.prune_reviewed_triage(self.output_root)
+
+        self.assertEqual(removed, [])
+        self.assertTrue((run_dir / "triage").exists())
+
+    def test_reviewed_run_with_no_triage_directory_is_a_noop(self) -> None:
+        self._make_run_dir("run-reviewed-no-triage", review_status="complete", with_triage=False)
+
+        removed = sanitizer.prune_reviewed_triage(self.output_root)
+
+        self.assertEqual(removed, [])
+
+    def test_only_reviewed_runs_are_cleaned_in_a_mixed_set(self) -> None:
+        reviewed = self._make_run_dir("run-a-reviewed", review_status="complete")
+        incomplete = self._make_run_dir("run-b-incomplete", review_status="incomplete")
+        unstarted = self._make_run_dir("run-c-not-started", review_status="not_started")
+
+        removed = sanitizer.prune_reviewed_triage(self.output_root)
+
+        self.assertEqual(removed, [reviewed / "triage"])
+        self.assertFalse((reviewed / "triage").exists())
+        self.assertTrue((incomplete / "triage").exists())
+        self.assertTrue((unstarted / "triage").exists())
+
+    def test_prune_ignores_staging_temp_directories(self) -> None:
+        stray_staging = self.output_root / ".20260101T000000.000000Z-abcd1234.tmp-xyz"
+        stray_staging.mkdir(parents=True)
+        (stray_staging / "manifest.json").write_text(json.dumps({"review": {"status": "complete"}}))
+        triage_dir = stray_staging / "triage" / "sanitized_document_01"
+        triage_dir.mkdir(parents=True)
+        (triage_dir / "residual_0001_page0001_street_address.png").write_bytes(b"crop")
+
+        removed = sanitizer.prune_reviewed_triage(self.output_root)
+
+        self.assertEqual(removed, [])
+        self.assertTrue((stray_staging / "triage").exists())
+
+    def test_prune_against_empty_output_root_returns_nothing(self) -> None:
+        empty_root = self.output_root / "does-not-exist-yet"
+        self.assertEqual(sanitizer.prune_reviewed_triage(empty_root), [])
 
 
 if __name__ == "__main__":

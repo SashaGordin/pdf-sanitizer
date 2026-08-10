@@ -31,8 +31,10 @@ issue #8's "apply now, light version" list:
       crash or hang.
 - [ ] A synthetic test that fills the staging directory past the disk
       ceiling proves the same controlled `FAIL` behavior.
-- [ ] After a successful run, that run's staging directory and triage-crop
-      directory no longer exist on disk.
+- [ ] After a successful run, that run's staging directory no longer exists
+      on disk; the triage-crop directory persists until a human completes
+      review (see issue #32 — triage-crop deletion is gated on
+      `manifest.review.status == "complete"`, not run completion).
 - [ ] A failed or interrupted run's staging/triage directories are left
       untouched (cleanup is success-only by design).
 - [ ] Running the retention-pruning step against a set of run directories
@@ -55,3 +57,9 @@ directory at pipeline completion — before a human ever gets to review it.
 Whoever implements this ticket should gate triage-crop deletion on review
 completion, not run completion, or ticket 06's reviewer tool will have
 nothing left to serve.
+
+Resolved by issue #32: `orchestrate_run()` no longer deletes `triage/` on
+run completion. A new maintenance step, `prune_reviewed_triage()` (wired
+into `tools/prune_runs.py` alongside the existing retention pruning), scans
+published runs and deletes only those whose `manifest.json` records
+`review.status == "complete"`.
