@@ -84,21 +84,19 @@ unblocks ticket 07's steps 2–3).
 **Blocked by:** none (execution of step 3 needs the client's OS, per step 1
 — an operator action, not another ticket).
 
-**Status:** ready-for-agent
+**Status:** done
 
 **GitHub issue:** not yet filed
 
-- [ ] Launching the built executable with no arguments and no terminal
-      opens a native file-picker restricted to PDF files. (Code path is in
-      place and unit-tested via a mocked picker; the actual Finder
-      double-click + native dialog needs a human with a GUI session — this
-      environment can invoke the built binary but can't click through a
-      real file dialog. See Comments.)
-- [ ] Selecting a real corpus PDF opens the same real-page labeling UI
+- [x] Launching the built executable with no arguments and no terminal
+      opens a native file-picker restricted to PDF files. Confirmed
+      2026-08-10 by the operator: double-clicked `dist/corpus-labeler` in
+      Finder, no terminal involved.
+- [x] Selecting a real corpus PDF opens the same real-page labeling UI
       ticket 04 built — no reimplementation, no visible JSON/export
-      schema, editable/removable labeled-item list. (Same GUI-session
-      caveat as above; the served HTML/JS is byte-for-byte ticket 04's,
-      unchanged.)
+      schema, editable/removable labeled-item list. Confirmed against a
+      real 203-page document (`21-project-manual.pdf`), labeling three
+      items across two different pages.
 - [x] The doc ID used for the exported filename is derived automatically
       from the picked file's name; nothing prompts the client to type one.
 - [x] Clicking "Export" writes a correctly-schemed JSON file into a
@@ -110,12 +108,13 @@ unblocks ticket 07's steps 2–3).
       `.scratch/corpus/labels/`) is unchanged, and ticket 04's existing
       tests for it still pass.
 - [x] The executable is actually built for the client's confirmed OS (macOS,
-      confirmed 2026-08-10), and a smoke pass against the built binary
-      (invoked directly with a real corpus fixture PDF, no Python/terminal
-      interpreter involved) completes: server starts, `/api/session`
-      returns the real page count, a synthetic export POST writes a
-      correctly-schemed JSON file. The literal double-click + GUI
-      click-through pass is still open — see Comments.
+      confirmed 2026-08-10), and a manual smoke pass completes without a
+      terminal or any file editing: the operator double-clicked
+      `dist/corpus-labeler` in Finder, picked a real 203-page document
+      (`21-project-manual.pdf`), labeled three items across two pages, and
+      exported — `labeled-output/21-project-manual.json` landed next to the
+      executable with a correctly-schemed payload (real bbox/scale/category
+      values, doc ID `21-project-manual` derived from the filename).
 - [x] A plain-language instructions file accompanies the executable,
       covering the one-time OS security warning and how to return the
       exported labels.
@@ -178,17 +177,23 @@ both now fixed in the build script:
    present, falling back to `.py` unchanged for the operator/dev/test path.
    Cold start is now ~5-6s (ordinary onefile extraction overhead).
 
-Smoke-tested the resulting binary directly (not via Finder, since this
-session has no interactive GUI to click through a real file-picker dialog):
-invoked with the same `<path> --doc-id <id> --output-dir <dir>` arguments
-the operator CLI uses, confirmed `/api/session` returns the real PDF's page
-count, and posted a synthetic export payload to `/api/export` — a
-correctly-schemed JSON landed on disk. This covers everything scriptable;
-still open is the literal manual pass: double-click `dist/corpus-labeler` in
-Finder with no arguments, confirm the native file-picker opens, pick a real
-corpus PDF, draw+tag at least one label, click Export, and confirm
-`labeled-output/` appears next to the executable — needs a human at the
-keyboard.
+Smoke-tested the resulting binary two ways. First, scripted (this
+environment has no interactive GUI to click through a real file-picker
+dialog): invoked with the same `<path> --doc-id <id> --output-dir <dir>`
+arguments the operator CLI uses, confirmed `/api/session` returns the real
+PDF's page count, and posted a synthetic export payload to `/api/export` —
+a correctly-schemed JSON landed on disk. Second, the operator ran the actual
+manual pass 2026-08-10: double-clicked `dist/corpus-labeler` in Finder with
+no arguments, the native file-picker opened, picked a real 203-page
+document (`21-project-manual.pdf`, not a fixture), labeled three items
+across two different pages, and exported. The resulting
+`labeled-output/21-project-manual.json` matches the schema
+`validate_export_payload()` expects (real bbox coordinates, `scale`,
+`category`/`sensitivity`/`disposition` per item) and the doc ID was
+correctly derived from the filename with no prompt to type one. All
+acceptance-checklist items are now closed.
 
-GitHub issue mirror for this ticket (see PR #25's pattern for tickets 01-07)
-also not yet filed.
+Still open, outside this ticket's scope: filing the GitHub issue mirror
+(see PR #25's pattern for tickets 01-07), and the distribution step itself
+(zipping the executable + instructions + unlabeled corpus PDFs and sending
+it to the client) — both operator actions.
