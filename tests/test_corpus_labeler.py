@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import http.client
 import importlib.util
 import io
@@ -9,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import fitz
 from PIL import Image
@@ -74,6 +76,59 @@ class DeriveDocIdTest(unittest.TestCase):
     def test_empty_after_sanitize_raises(self):
         with self.assertRaises(ValueError):
             labeler.derive_doc_id(Path("...pdf"), override="***")
+
+
+class RunningExecutableDirTest(unittest.TestCase):
+    def test_defaults_to_cwd_when_not_frozen(self):
+        with mock.patch.object(sys, "frozen", False, create=True):
+            self.assertEqual(labeler.running_executable_dir(), Path.cwd())
+
+    def test_uses_executable_parent_when_frozen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe_path = Path(tmp) / "corpus-labeler"
+            exe_path.write_bytes(b"")
+            with mock.patch.object(sys, "frozen", True, create=True), \
+                 mock.patch.object(sys, "executable", str(exe_path)):
+                self.assertEqual(labeler.running_executable_dir(), exe_path.resolve().parent)
+
+
+class ResolveInputAndOutputTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.pdf_path = self.root / "ca_dgs_atascadero_book1.pdf"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    @staticmethod
+    def _args(pdf_path=None, output_dir=None):
+        return argparse.Namespace(pdf_path=pdf_path, output_dir=output_dir)
+
+    def test_explicit_path_keeps_operator_default_output_dir(self):
+        with mock.patch.object(labeler, "pick_pdf_via_file_dialog") as picker:
+            result = labeler.resolve_input_and_output(self._args(pdf_path=self.pdf_path), self.root)
+        picker.assert_not_called()
+        self.assertEqual(result, (self.pdf_path, self.root / ".scratch/corpus/labels"))
+
+    def test_explicit_path_with_explicit_output_dir_is_unchanged(self):
+        custom = self.root / "custom-out"
+        result = labeler.resolve_input_and_output(
+            self._args(pdf_path=self.pdf_path, output_dir=custom), self.root,
+        )
+        self.assertEqual(result, (self.pdf_path, custom))
+
+    def test_no_path_picks_file_and_defaults_to_labeled_output_next_to_executable(self):
+        exe_dir = self.root / "exe_dir"
+        with mock.patch.object(labeler, "pick_pdf_via_file_dialog", return_value=self.pdf_path), \
+             mock.patch.object(labeler, "running_executable_dir", return_value=exe_dir):
+            result = labeler.resolve_input_and_output(self._args(), self.root)
+        self.assertEqual(result, (self.pdf_path, exe_dir / "labeled-output"))
+
+    def test_cancelled_file_picker_returns_none(self):
+        with mock.patch.object(labeler, "pick_pdf_via_file_dialog", return_value=None):
+            result = labeler.resolve_input_and_output(self._args(), self.root)
+        self.assertIsNone(result)
 
 
 class RenderPagePngTest(unittest.TestCase):

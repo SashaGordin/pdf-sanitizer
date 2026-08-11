@@ -1,0 +1,15 @@
+# Trimmed dependency set for building the packaged corpus_labeler.py
+# executable (ticket 08) -- only what corpus_labeler.py and the sibling
+# anonymize_construction_pdfs.py module actually import at module load time.
+# Deliberately excludes zxing-cpp/reportlab (requirements-anonymizer.txt) and
+# torch/transformers (requirements-anonymizer-ner.txt): none of those are
+# imported by either module, and pulling them into a PyInstaller build venv
+# would bloat the executable the client downloads.
+#
+# Regenerate the hash-pinned lockfile (requirements-corpus-labeler.lock.txt)
+# the same way as requirements-anonymizer.lock.txt:
+#   <build-venv>/bin/python -m pip install pip-tools
+#   <build-venv>/bin/python -m piptools compile --generate-hashes --allow-unsafe \
+#       --output-file=requirements-corpus-labeler.lock.txt requirements-corpus-labeler.txt
+PyMuPDF>=1.24,<2
+Pillow>=10,<13

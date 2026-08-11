@@ -1,5 +1,6 @@
 # --- Python ---
 .venv-anonymizer/
+.venv-corpus-labeler-build/
 .venv/
 __pycache__/
 *.py[cod]
@@ -19,6 +20,11 @@ models/
 
 # --- Generated output ---
 output/
+
+# --- PyInstaller build artifacts (tools/build_corpus_labeler_executable.py) ---
+/build/
+/dist/
+labeled-output/
 
 # --- Scratch / intermediate working dirs ---
 tmp/
