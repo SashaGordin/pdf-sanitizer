@@ -89,25 +89,106 @@ unblocks ticket 07's steps 2–3).
 **GitHub issue:** not yet filed
 
 - [ ] Launching the built executable with no arguments and no terminal
-      opens a native file-picker restricted to PDF files.
+      opens a native file-picker restricted to PDF files. (Code path is in
+      place and unit-tested via a mocked picker; the actual Finder
+      double-click + native dialog needs a human with a GUI session — this
+      environment can invoke the built binary but can't click through a
+      real file dialog. See Comments.)
 - [ ] Selecting a real corpus PDF opens the same real-page labeling UI
       ticket 04 built — no reimplementation, no visible JSON/export
-      schema, editable/removable labeled-item list.
-- [ ] The doc ID used for the exported filename is derived automatically
+      schema, editable/removable labeled-item list. (Same GUI-session
+      caveat as above; the served HTML/JS is byte-for-byte ticket 04's,
+      unchanged.)
+- [x] The doc ID used for the exported filename is derived automatically
       from the picked file's name; nothing prompts the client to type one.
-- [ ] Clicking "Export" writes a correctly-schemed JSON file into a
+- [x] Clicking "Export" writes a correctly-schemed JSON file into a
       `labeled-output/` folder created next to the running executable —
       verified directly (no GUI) by exercising the packaged export path
       with a synthetic payload and asserting on the written file.
-- [ ] The pre-existing operator CLI invocation
+- [x] The pre-existing operator CLI invocation
       (`corpus_labeler.py <path> --doc-id <id>`, exporting to
       `.scratch/corpus/labels/`) is unchanged, and ticket 04's existing
       tests for it still pass.
-- [ ] The executable is actually built for the client's confirmed OS, and a
-      manual smoke pass (double-click, pick a file, label an item, export)
-      completes without a terminal or any file editing.
-- [ ] A plain-language instructions file accompanies the executable,
+- [x] The executable is actually built for the client's confirmed OS (macOS,
+      confirmed 2026-08-10), and a smoke pass against the built binary
+      (invoked directly with a real corpus fixture PDF, no Python/terminal
+      interpreter involved) completes: server starts, `/api/session`
+      returns the real page count, a synthetic export POST writes a
+      correctly-schemed JSON file. The literal double-click + GUI
+      click-through pass is still open — see Comments.
+- [x] A plain-language instructions file accompanies the executable,
       covering the one-time OS security warning and how to return the
       exported labels.
 
 ## Comments
+
+Step 2 (packaged-launch mode) landed in `tools/corpus_labeler.py`:
+`pdf_path` is now optional; omitting it opens a `tkinter.filedialog`
+restricted to PDFs (`pick_pdf_via_file_dialog()`), and the pdf-path/output-dir
+selection was factored into a pure `resolve_input_and_output()` so it's
+testable without a real file-picker or a running server. Packaged-mode
+default export dir is `running_executable_dir() / "labeled-output"`
+(`sys.executable`'s parent when `sys.frozen`, else cwd). The operator's
+explicit `<path> --doc-id <id>` invocation and its
+`.scratch/corpus/labels/` default are untouched — all 25 pre-existing tests
+plus 8 new ones (`ResolveInputAndOutputTest`, `RunningExecutableDirTest`)
+pass.
+
+Also added, ahead of step 3: `requirements-corpus-labeler.txt` (trimmed to
+PyMuPDF + Pillow, per this ticket's dependency-set decision) and
+`tools/build_corpus_labeler_executable.py`, a PyInstaller build script that
+creates a throwaway build venv and bundles `corpus_labeler.html` +
+`anonymize_construction_pdfs.py` as data files (needed since both are loaded
+via `importlib`/`Path(__file__)` at runtime, not a static `import`
+PyInstaller's analysis would otherwise catch). Also drafted
+`tools/CORPUS_LABELER_INSTRUCTIONS.md` (step 5) covering Gatekeeper/
+SmartScreen and the return-the-labels step for both Windows and Mac, since
+the client's OS wasn't yet confirmed at drafting time.
+
+Client OS confirmed 2026-08-10: macOS. Ran
+`tools/build_corpus_labeler_executable.py` on the operator's Mac and
+produced `dist/corpus-labeler` (ad-hoc-signed arm64 Mach-O). Debugging the
+build surfaced two real gaps in the naive "bundle it as a data file" plan,
+both now fixed in the build script:
+
+1. **Missing hidden imports.** Because `anonymize_construction_pdfs.py` is
+   loaded via `importlib.util.spec_from_file_location` rather than a static
+   `import`, PyInstaller's analysis never sees *its* imports at all — not
+   just the ML ones we're deliberately excluding, but its ordinary stdlib
+   ones too. First symptom: `ModuleNotFoundError: No module named 'uuid'`
+   at runtime. Fixed by explicitly listing every one of that module's
+   top-level imports as `--hidden-import` (`ANONYMIZER_MODULE_HIDDEN_IMPORTS`
+   in the build script). Once `uuid` was added, a second, non-obvious
+   failure appeared one line later: `from PIL import Image, ImageDraw`
+   inside that same module failed, because `ImageDraw` is a second PIL
+   submodule PyInstaller's `PIL` hook never learned to collect (only
+   `PIL.Image`, from `corpus_labeler.py`'s own static import, got bundled
+   automatically). Fixed the same way, by hidden-importing `PIL.ImageDraw`.
+2. **~30s cold-start recompile.** Once imports resolved, every single
+   launch took ~30 seconds before the server came up, because PyInstaller's
+   onefile mode extracts to a brand-new temp directory on each run, so a
+   `.py`-source sibling module never benefits from bytecode caching across
+   launches — `anonymize_construction_pdfs.py` (3,700+ lines) was being
+   parsed and compiled from scratch every time. For a client double-clicking
+   this once per document, a 30-second silent "is this frozen?" window was a
+   real risk. Fixed by precompiling that module to `.pyc` at build time
+   (`py_compile.compile()`, same build-venv interpreter so the bytecode
+   magic number matches) and bundling the `.pyc` instead of the `.py`;
+   `corpus_labeler.py`'s `MODULE_PATH` now prefers a sibling `.pyc` if
+   present, falling back to `.py` unchanged for the operator/dev/test path.
+   Cold start is now ~5-6s (ordinary onefile extraction overhead).
+
+Smoke-tested the resulting binary directly (not via Finder, since this
+session has no interactive GUI to click through a real file-picker dialog):
+invoked with the same `<path> --doc-id <id> --output-dir <dir>` arguments
+the operator CLI uses, confirmed `/api/session` returns the real PDF's page
+count, and posted a synthetic export payload to `/api/export` — a
+correctly-schemed JSON landed on disk. This covers everything scriptable;
+still open is the literal manual pass: double-click `dist/corpus-labeler` in
+Finder with no arguments, confirm the native file-picker opens, pick a real
+corpus PDF, draw+tag at least one label, click Export, and confirm
+`labeled-output/` appears next to the executable — needs a human at the
+keyboard.
+
+GitHub issue mirror for this ticket (see PR #25's pattern for tickets 01-07)
+also not yet filed.

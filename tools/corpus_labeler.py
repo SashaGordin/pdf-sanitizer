@@ -13,6 +13,13 @@ this does not make the tool a network service (ADR-0001).
 
     .venv-anonymizer/bin/python tools/corpus_labeler.py path/to/document.pdf
     .venv-anonymizer/bin/python tools/corpus_labeler.py path/to/document.pdf --doc-id my_doc
+
+Packaged-launch mode (ticket 08): invoked with no positional path -- as
+happens when a client double-clicks the PyInstaller-built executable -- this
+opens a native file-picker restricted to PDFs instead of requiring a
+command-line argument, and defaults the export directory to a
+`labeled-output/` folder created next to the running executable rather than
+the operator-workflow `.scratch/corpus/labels/`.
 """
 
 from __future__ import annotations
@@ -38,7 +45,16 @@ except ImportError as exc:  # pragma: no cover
         "Required local PDF dependencies are missing. Install requirements-anonymizer.txt."
     ) from exc
 
-MODULE_PATH = Path(__file__).with_name("anonymize_construction_pdfs.py")
+# A packaged build (build_corpus_labeler_executable.py) ships a precompiled
+# .pyc instead of the 3,700+-line .py source: PyInstaller's onefile mode
+# extracts to a fresh temp dir every launch, so a bytecode cache never
+# survives between runs -- without this, every double-click paid a ~30s
+# from-source recompile before the UI appeared.
+_PRECOMPILED_MODULE_PATH = Path(__file__).with_name("anonymize_construction_pdfs.pyc")
+MODULE_PATH = (
+    _PRECOMPILED_MODULE_PATH if _PRECOMPILED_MODULE_PATH.exists()
+    else Path(__file__).with_name("anonymize_construction_pdfs.py")
+)
 _spec = importlib.util.spec_from_file_location("pdf_sanitizer", MODULE_PATH)
 sanitizer = importlib.util.module_from_spec(_spec)
 assert _spec and _spec.loader
@@ -81,6 +97,60 @@ def derive_doc_id(pdf_path: Path, override: str | None = None) -> str:
             f"could not derive a usable doc-id from {raw!r}; pass --doc-id explicitly"
         )
     return doc_id
+
+
+def running_executable_dir() -> Path:
+    """Directory the packaged export default is anchored to.
+
+    Under PyInstaller, `sys.frozen` is set and `sys.executable` is the
+    double-clicked binary itself (not a Python interpreter); anywhere else
+    (dev checkout, tests) there is no meaningful "running executable", so
+    fall back to the current working directory.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path.cwd()
+
+
+def pick_pdf_via_file_dialog() -> Path | None:
+    """Native file-picker restricted to PDFs; ``None`` means the client cancelled."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root_window = tk.Tk()
+    root_window.withdraw()
+    root_window.attributes("-topmost", True)
+    try:
+        selected = filedialog.askopenfilename(
+            title="Select a PDF to label",
+            filetypes=[("PDF files", "*.pdf")],
+        )
+    finally:
+        root_window.destroy()
+    return Path(selected) if selected else None
+
+
+def resolve_input_and_output(
+    args: argparse.Namespace, root: Path,
+) -> tuple[Path, Path] | None:
+    """The picked/given PDF path and its export directory, or ``None`` if
+    the client cancelled the packaged-launch file-picker.
+
+    An explicit `pdf_path` keeps the operator's existing default export
+    directory (`.scratch/corpus/labels/`, which assumes a repo checkout);
+    the no-argument packaged-launch path defaults instead to
+    `labeled-output/` next to the running executable, since the client's
+    machine has no repo checkout for that path to resolve against.
+    """
+    if args.pdf_path is not None:
+        output_dir = args.output_dir if args.output_dir is not None else root / ".scratch/corpus/labels"
+        return args.pdf_path, output_dir
+
+    picked = pick_pdf_via_file_dialog()
+    if picked is None:
+        return None
+    output_dir = args.output_dir if args.output_dir is not None else running_executable_dir() / "labeled-output"
+    return picked, output_dir
 
 
 def render_page_png(
@@ -294,13 +364,13 @@ class LabelerRequestHandler(http.server.BaseHTTPRequestHandler):
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     root = Path(__file__).resolve().parents[1]
-    parser.add_argument("pdf_path", type=Path)
+    parser.add_argument("pdf_path", type=Path, nargs="?", default=None)
     parser.add_argument("--doc-id", default=None)
     parser.add_argument("--dpi", type=int, default=150)
     parser.add_argument("--max-dimension", type=int, default=1600)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--output-dir", type=Path, default=root / ".scratch/corpus/labels")
+    parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args(argv)
 
@@ -311,6 +381,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    resolved = resolve_input_and_output(args, root)
+    if resolved is None:
+        print("No file selected; exiting.")
+        return 0
+    args.pdf_path, args.output_dir = resolved
 
     try:
         doc_id = derive_doc_id(args.pdf_path, args.doc_id)
