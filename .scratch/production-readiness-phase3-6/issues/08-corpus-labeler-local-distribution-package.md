@@ -86,7 +86,7 @@ unblocks ticket 07's steps 2–3).
 
 **Status:** done
 
-**GitHub issue:** not yet filed
+**GitHub issue:** https://github.com/SashaGordin/pdf-sanitizer/issues/37
 
 - [x] Launching the built executable with no arguments and no terminal
       opens a native file-picker restricted to PDF files. Confirmed
@@ -193,7 +193,7 @@ across two different pages, and exported. The resulting
 correctly derived from the filename with no prompt to type one. All
 acceptance-checklist items are now closed.
 
-Still open, outside this ticket's scope: filing the GitHub issue mirror
-(see PR #25's pattern for tickets 01-07), and the distribution step itself
-(zipping the executable + instructions + unlabeled corpus PDFs and sending
-it to the client) — both operator actions.
+GitHub issue mirror filed and closed as issue #37 (see PR #25's pattern for
+tickets 01-07). Still open, outside this ticket's scope: the distribution
+step itself (sending the client the packaged executable and collecting
+labels back) — an operator action.
